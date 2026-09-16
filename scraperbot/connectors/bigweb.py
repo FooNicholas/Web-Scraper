@@ -8,7 +8,13 @@ from typing import Any
 
 import httpx
 
-from scraperbot.connectors.base import StoreConnector, StoreUnavailableError, matches_card_finish, references_card
+from scraperbot.connectors.base import (
+    StoreConnector,
+    StoreUnavailableError,
+    matches_card_finish,
+    references_card,
+    request_client,
+)
 from scraperbot.models import Availability, CardPrint, MatchConfidence, StoreOffer, finish_from_text, normalise_set_code
 
 
@@ -107,11 +113,8 @@ class BigWebConnector(StoreConnector):
 
     async def _get_json(self, url: str, *, params: Mapping[str, Any] | None = None) -> Any:
         headers = {"User-Agent": "ScraperBot/0.1 (+personal price comparison)"}
-        if self.client:
-            response = await self.client.get(url, params=params, headers=headers)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(url, params=params, headers=headers)
+        async with request_client(self.client) as client:
+            response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
         return response.json()
 

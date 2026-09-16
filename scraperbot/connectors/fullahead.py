@@ -12,7 +12,9 @@ import httpx
 from scraperbot.connectors.base import (
     StoreConnector,
     StoreUnavailableError,
+    bounded_map,
     matches_card_finish,
+    request_client,
     references_card,
     retailer_print_reference,
 )
@@ -36,14 +38,17 @@ class FullAheadConnector(StoreConnector):
     async def search(self, card: CardPrint) -> list[StoreOffer]:
         response = await self._post(self.search_url, data={"search": retailer_print_reference(card)})
         offers = self.parse_html(card, self._decode(response))
-        for index, offer in enumerate(offers[:8]):
+        async def enrich(offer: StoreOffer) -> StoreOffer:
             if not offer.listing_url:
-                continue
+                return offer
             try:
                 detail = await self._get(offer.listing_url)
             except (httpx.HTTPError, StoreUnavailableError):
-                continue
-            offers[index] = self._with_detail_stock(offer, self._decode(detail))
+                return offer
+            return self._with_detail_stock(offer, self._decode(detail))
+
+        enriched = await bounded_map(offers[:8], enrich)
+        offers[: len(enriched)] = enriched
         return offers
 
     async def _post(self, url: str, *, data: dict[str, str]) -> httpx.Response:
@@ -54,11 +59,8 @@ class FullAheadConnector(StoreConnector):
 
     async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         headers = {"User-Agent": "JP-Price-Checker/0.1 (+approved personal price comparison)"}
-        if self.client:
-            response = await getattr(self.client, method)(url, headers=headers, **kwargs)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await getattr(client, method)(url, headers=headers, **kwargs)
+        async with request_client(self.client) as client:
+            response = await getattr(client, method)(url, headers=headers, **kwargs)
         if response.status_code in (403, 429):
             raise StoreUnavailableError("FullAhead did not permit this price request.")
         if response.status_code == 404:

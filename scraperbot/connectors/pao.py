@@ -12,7 +12,9 @@ import httpx
 from scraperbot.connectors.base import (
     StoreConnector,
     StoreUnavailableError,
+    bounded_map,
     matches_card_finish,
+    request_client,
     references_card,
     retailer_print_reference,
 )
@@ -36,14 +38,17 @@ class PAOConnector(StoreConnector):
     async def search(self, card: CardPrint) -> list[StoreOffer]:
         response = await self._get(self.search_url, params={"search_keyword": retailer_print_reference(card)})
         offers = self.parse_html(card, response.text)
-        for index, offer in enumerate(offers[:8]):
+        async def enrich(offer: StoreOffer) -> StoreOffer:
             if not offer.listing_url:
-                continue
+                return offer
             try:
                 detail = await self._get(offer.listing_url)
             except (httpx.HTTPError, StoreUnavailableError):
-                continue
-            offers[index] = self._with_detail_stock(offer, detail.text)
+                return offer
+            return self._with_detail_stock(offer, detail.text)
+
+        enriched = await bounded_map(offers[:8], enrich)
+        offers[: len(enriched)] = enriched
         return offers
 
     async def _get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
@@ -51,11 +56,8 @@ class PAOConnector(StoreConnector):
         request_kwargs: dict[str, object] = {"headers": headers}
         if params is not None:
             request_kwargs["params"] = params
-        if self.client:
-            response = await self.client.get(url, **request_kwargs)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(url, **request_kwargs)
+        async with request_client(self.client) as client:
+            response = await client.get(url, **request_kwargs)
         if response.status_code in (403, 429):
             raise StoreUnavailableError("PAO did not permit this price request.")
         if response.status_code == 404:

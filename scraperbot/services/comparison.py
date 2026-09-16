@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from time import monotonic
 from typing import Iterable
 
-from scraperbot.connectors.base import StoreConnector, StoreUnavailableError
+import httpx
+
+from scraperbot.connectors.base import (
+    StoreConnector,
+    StoreUnavailableError,
+    active_request_client,
+    use_shared_request_client,
+)
 from scraperbot.models import (
     Availability,
     CardFamilyComparisonResult,
@@ -16,6 +23,7 @@ from scraperbot.models import (
     ComparisonResult,
     FamilyOffer,
     StoreOffer,
+    StoreCheckTiming,
 )
 
 
@@ -37,26 +45,43 @@ class ComparisonService:
         with self._cache_lock:
             cached = self._cache.get(cache_key)
         if not refresh and cached and cached.expires_at > monotonic():
-            return cached.result
+            return replace(cached.result, cached=True)
 
-        results = await asyncio.gather(
-            *(connector.search(card) for connector in self.connectors),
-            return_exceptions=True,
-        )
+        started_at = monotonic()
+        shared_client = active_request_client()
+        if shared_client is not None:
+            results = await self._check_all_connectors(card)
+        else:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                with use_shared_request_client(client):
+                    results = await self._check_all_connectors(card)
         offers: list[StoreOffer] = []
         no_active_listing: list[str] = []
         unavailable: list[str] = []
         failed: list[str] = []
-        for connector, outcome in zip(self.connectors, results, strict=True):
+        timings: list[StoreCheckTiming] = []
+        for connector, outcome, elapsed_ms in results:
             if isinstance(outcome, StoreUnavailableError):
                 unavailable.append(connector.store_name)
+                outcome_name = "unavailable"
             elif isinstance(outcome, Exception):
                 failed.append(connector.store_name)
+                outcome_name = "failed"
             else:
                 if outcome:
                     offers.extend(outcome)
+                    outcome_name = "offers"
                 else:
                     no_active_listing.append(connector.store_name)
+                    outcome_name = "no_active_listing"
+            timings.append(
+                StoreCheckTiming(
+                    connector.store_id,
+                    connector.store_name,
+                    outcome_name,
+                    elapsed_ms,
+                )
+            )
 
         result = ComparisonResult(
             card=card,
@@ -64,10 +89,31 @@ class ComparisonService:
             no_active_listing_stores=tuple(no_active_listing),
             unavailable_stores=tuple(unavailable),
             failed_stores=tuple(failed),
+            store_timings=tuple(timings),
+            duration_ms=round((monotonic() - started_at) * 1000),
         )
         with self._cache_lock:
             self._cache[cache_key] = _CachedResult(monotonic() + self.cache_ttl_seconds, result)
         return result
+
+    @staticmethod
+    async def _check_connector(
+        connector: StoreConnector, card: CardPrint
+    ) -> tuple[StoreConnector, list[StoreOffer] | Exception, int]:
+        started_at = monotonic()
+        try:
+            outcome: list[StoreOffer] | Exception = await connector.search(card)
+        except Exception as error:  # Each store remains isolated from every other store.
+            outcome = error
+        return connector, outcome, round((monotonic() - started_at) * 1000)
+
+    async def _check_all_connectors(
+        self, card: CardPrint
+    ) -> list[tuple[StoreConnector, list[StoreOffer] | Exception, int]]:
+        """Start every store together; none is skipped to improve latency."""
+        return await asyncio.gather(
+            *(self._check_connector(connector, card) for connector in self.connectors),
+        )
 
     async def compare_family(
         self, selected_card: CardPrint, printings: Iterable[CardPrint], *, refresh: bool = False

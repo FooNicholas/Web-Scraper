@@ -13,6 +13,7 @@ from scraperbot.connectors.base import (
     StoreUnavailableError,
     matches_card_finish,
     references_card,
+    request_client,
     retailer_print_reference,
 )
 from scraperbot.models import Availability, CardPrint, MatchConfidence, StoreOffer, finish_from_text
@@ -41,11 +42,8 @@ class RyuunoshippoConnector(StoreConnector):
 
     async def _get(self, url: str, *, params: dict[str, str]) -> httpx.Response:
         headers = {"User-Agent": "JP-Price-Checker/0.1 (+approved personal price comparison)"}
-        if self.client:
-            response = await self.client.get(url, params=params, headers=headers)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(url, params=params, headers=headers)
+        async with request_client(self.client) as client:
+            response = await client.get(url, params=params, headers=headers)
         if response.status_code in (403, 429):
             raise StoreUnavailableError("Ryuunoshippo did not permit this price request.")
         if response.status_code == 404:

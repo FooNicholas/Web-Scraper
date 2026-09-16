@@ -13,6 +13,7 @@ from scraperbot.connectors.base import (
     StoreUnavailableError,
     matches_card_finish,
     references_card,
+    request_client,
     retailer_print_reference,
 )
 from scraperbot.models import Availability, CardPrint, MatchConfidence, StoreOffer, finish_from_text
@@ -79,11 +80,8 @@ class OltaConnector(StoreConnector):
             "User-Agent": "JP-Price-Checker/0.1 (+approved personal price comparison)",
             "Content-Type": "application/json",
         }
-        if self.client:
-            response = await self.client.post(url, json=json, headers=headers)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.post(url, json=json, headers=headers)
+        async with request_client(self.client) as client:
+            response = await client.post(url, json=json, headers=headers)
         if response.status_code in (403, 429):
             raise StoreUnavailableError("Card Shop Olta did not permit this price request.")
         if response.status_code == 404:

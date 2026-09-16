@@ -83,6 +83,14 @@ def test_local_web_search_and_comparison_share_the_catalogue(tmp_path: Path) -> 
         assert comparison["offers"][0]["match_confidence"] == "exact_japanese_name"
         assert comparison["offers"][0]["stock_count"] == 3
         assert comparison["family_print_count"] == 1
+        assert comparison["cached"] is False
+        assert comparison["duration_ms"] >= 0
+        timing = comparison["store_timings"]
+        assert len(timing) == 1
+        assert timing[0]["store_id"] == "example"
+        assert timing[0]["store_name"] == "Example Store"
+        assert timing[0]["outcome"] == "offers"
+        assert timing[0]["elapsed_ms"] >= 0
 
         lowest = asyncio.run(app.compare_family(card.id or 0))
         assert lowest["print_count"] == 1
@@ -187,6 +195,12 @@ def test_browser_ui_separates_print_aggregation_from_selected_print_sorting() ->
     assert "☰↓" in INDEX_HTML
     assert "renderCurrentComparison" in INDEX_HTML
     assert "Activate to sort" in INDEX_HTML
+
+
+def test_browser_ui_exposes_full_store_timing_details_after_a_comparison() -> None:
+    assert "view timings" in INDEX_HTML
+    assert "store_timings" in INDEX_HTML
+    assert "comparisonStatus(data)" in INDEX_HTML
 
 
 def test_browser_ui_only_checks_or_installs_catalogue_updates_after_a_user_action() -> None:

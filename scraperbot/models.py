@@ -268,6 +268,19 @@ class ComparisonResult:
     no_active_listing_stores: tuple[str, ...] = ()
     unavailable_stores: tuple[str, ...] = ()
     failed_stores: tuple[str, ...] = ()
+    store_timings: tuple["StoreCheckTiming", ...] = ()
+    duration_ms: int = 0
+    cached: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StoreCheckTiming:
+    """One connector's outcome and wall-clock time in a comparison."""
+
+    store_id: str
+    store_name: str
+    outcome: str
+    elapsed_ms: int
 
 
 @dataclass(frozen=True, slots=True)

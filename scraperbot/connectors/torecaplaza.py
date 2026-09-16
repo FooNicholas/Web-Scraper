@@ -12,8 +12,10 @@ import httpx
 from scraperbot.connectors.base import (
     StoreConnector,
     StoreUnavailableError,
+    bounded_map,
     matches_card_finish,
     references_card,
+    request_client,
     retailer_print_reference,
 )
 from scraperbot.models import Availability, CardPrint, MatchConfidence, StoreOffer, finish_from_text
@@ -38,29 +40,24 @@ class TorecaPlazaConnector(StoreConnector):
             params={"mode": "srh", "cid": "2921527,2", "keyword": retailer_print_reference(card)},
         )
         listings = self.parse_search_html(card, response.text)
-        offers: list[StoreOffer] = []
         # The public search is constrained to one serial. This cap protects
         # against a retailer regression broadening that search unexpectedly.
-        for listing_url in listings[:8]:
+        async def inspect(listing_url: str) -> StoreOffer | None:
             try:
                 detail = await self._get(listing_url)
             except (httpx.HTTPError, StoreUnavailableError):
-                continue
-            offer = self.parse_product_html(card, listing_url, detail.text)
-            if offer:
-                offers.append(offer)
-        return offers
+                return None
+            return self.parse_product_html(card, listing_url, detail.text)
+
+        return [offer for offer in await bounded_map(listings[:8], inspect) if offer]
 
     async def _get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
         headers = {"User-Agent": "JP-Price-Checker/0.1 (+approved personal price comparison)"}
         request_kwargs = {"headers": headers}
         if params is not None:
             request_kwargs["params"] = params
-        if self.client:
-            response = await self.client.get(url, **request_kwargs)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(url, **request_kwargs)
+        async with request_client(self.client) as client:
+            response = await client.get(url, **request_kwargs)
         if response.status_code in (403, 429):
             raise StoreUnavailableError("Toreca Plaza 55 did not permit this price request.")
         if response.status_code == 404:

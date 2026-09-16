@@ -15,6 +15,7 @@ from scraperbot.connectors.base import (
     matches_card_finish,
     price_from_text,
     references_card,
+    request_client,
 )
 from scraperbot.models import Availability, CardPrint, MatchConfidence, StoreOffer, finish_from_text
 
@@ -37,11 +38,8 @@ class YuyuTeiConnector(StoreConnector):
         known_promo_page = self.promo_page_url(card) if self.promo_page_url and card.set_code == "DPR" else None
         url = known_promo_page or f"{self.base_url}/sell/vg/s/{card.set_code.lower()}"
         headers = {"User-Agent": "ScraperBot/0.1 (+personal price comparison)"}
-        if self.client:
-            response = await self.client.get(url, headers=headers)
-        else:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(url, headers=headers)
+        async with request_client(self.client) as client:
+            response = await client.get(url, headers=headers)
         if response.status_code == 404:
             raise StoreUnavailableError(f"Yuyu-Tei does not list the set {card.set_code}.")
         response.raise_for_status()

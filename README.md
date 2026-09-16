@@ -41,6 +41,9 @@ comfortable with that warning.
 4. Use **Refresh prices** when you want a fresh check. Normal comparisons use a
    short local cache so repeatedly clicking a print does not repeatedly request
    every store.
+5. Open **view timings** above the offers if a comparison feels slow. It shows
+   how long each supported store took and whether it returned offers, no active
+   listing, or an unavailable response.
 
 Use **Aggregate card prints** to compare all verified Japanese reprints of the
 same card. The sort button in the price pane changes the ordering of the offers
@@ -67,6 +70,11 @@ search.
 Selecting a printing checks supported stores at that time; card-name search
 itself does not refresh store prices. A displayed sold-out price is kept and
 labelled as sold out rather than being discarded.
+
+All supported stores are checked for every fresh comparison. The app runs those
+checks together, keeps connections warm while the app is open, and limits only
+same-store product-detail requests to two at a time. This keeps comparisons
+complete while avoiding a burst of detail-page requests to one store.
 
 **Check catalogue update** updates card names, printings, mappings, and search
 data only. It never refreshes store prices and never makes your computer crawl

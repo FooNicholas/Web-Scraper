@@ -44,8 +44,8 @@ English name / Japanese serial
 | Search and domain model | `scraperbot/query.py`, `scraperbot/models.py` | Normalises queries, serials, rarity, finish, names, and offer states. |
 | Catalogue repository | `scraperbot/catalogue/repository.py` | Owns SQLite schema, fuzzy search, Japanese serial lookup, identity links, and migrations. |
 | Catalogue importers | `scraperbot/catalogue/` | Imports official Japanese/English references, Fandom mappings, official promo identity, and Yuyu-Tei promo locations. |
-| Price comparison | `scraperbot/services/comparison.py` | Runs connectors concurrently and keeps a 120-second in-memory result cache. |
-| Store connectors | `scraperbot/connectors/` | Performs bounded public lookup of one selected Japanese print at a time. |
+| Price comparison | `scraperbot/services/comparison.py` | Starts every connector concurrently, records each outcome and elapsed time, and keeps a 120-second in-memory result cache. |
+| Store connectors | `scraperbot/connectors/` | Performs bounded public lookup of one selected Japanese print at a time. The browser shares a warm HTTP session between selected cards. |
 | Distribution | `scraperbot/distribution.py`, `scraperbot/catalogue_snapshot.py` | Builds, verifies, seeds, checks, and atomically installs SQLite catalogue snapshots. |
 | Native packaging | `scripts/build_desktop.py`, `.github/workflows/build-desktop-downloads.yml` | Packages matching Apple-silicon macOS and Windows x64 builds and attaches them to a GitHub Release draft. |
 
@@ -87,6 +87,15 @@ printing, then joins the results. It does not loosen a retailer search into a
 name search. Price sorting is presentation-only; the **Refresh prices** action
 is the explicit way to bypass the 120-second comparison cache.
 
+Every fresh selected-print comparison starts all registered stores together;
+the result is complete only after every connector has returned an outcome.
+The browser shows the overall elapsed time and a collapsed per-store timing
+list. It keeps one HTTP client alive for the local app session, so a shopper
+moving through different cards can reuse existing connections. Product-detail
+connectors use `bounded_map` with `DETAIL_REQUEST_CONCURRENCY = 2`: this
+preserves every candidate in the existing per-store cap while avoiding the old
+serial detail-page wait and avoiding an aggressive same-store request burst.
+
 Offers preserve price, availability, listed stock quantity when present,
 condition, raw finish text, and matching confidence. In-stock offers sort ahead
 of sold-out and unknown-stock offers; unavailable prices stay last.
@@ -121,6 +130,13 @@ It should return the displayed price, stock state, and quantity only when the
 site exposes them. A connector must fail closed with `StoreUnavailableError`
 when a set is not listed, the response is overbroad, or a matching print cannot
 be verified.
+
+When a connector needs several detail pages after an already-bounded search,
+use `bounded_map` rather than a serial loop. Keep the existing candidate cap,
+preserve the returned order, and leave `DETAIL_REQUEST_CONCURRENCY` at two
+unless a new measured, permitted-store policy is reviewed. Do not omit a store
+from a comparison merely because it is slow; the timing data identifies the
+store for maintenance.
 
 G-Project is the documented exception: its public catalogue does not expose a
 printed serial. Its connector is restricted to exact Japanese-name, set, and
@@ -257,6 +273,7 @@ token to a release.
 | Catalogue upkeep | Run an opt-in refresh when new sets or promos arrive; resolve only mappings with direct evidence. |
 | Promo review backlog | Review playable Japanese promos that remain unmapped. Utility cards stay serial-only by design. |
 | Connector health | Periodically run fixture tests and live spot checks; adjust parsers only when the public storefront changes. |
+| Slow-store investigation | Use the in-app timing list after normal shopper sessions to identify persistent outliers before changing a connector's query or parser. |
 
 ### On hold or gated
 
@@ -277,6 +294,8 @@ token to a release.
 - Reviewed official/Fandom/Yuyu-Tei promo and regional mapping workflow.
 - Local browser interface, Telegram interface, 26 supported store connectors,
   and a cautious documented exception for G-Project.
+- Complete all-store fan-out, per-store timing diagnostics, warm browser-session
+  connections, and bounded two-at-a-time product-detail retrieval.
 - Versioned, verified catalogue snapshots and native Apple-silicon/Windows
   packaging workflow.
 

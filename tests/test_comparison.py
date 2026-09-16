@@ -1,4 +1,5 @@
 import asyncio
+from time import monotonic
 
 from scraperbot.connectors.base import StoreConnector, StoreUnavailableError
 from scraperbot.models import Availability, CardPrint, MatchConfidence, StoreOffer
@@ -30,6 +31,19 @@ class FamilyConnector(StoreConnector):
     async def search(self, card: CardPrint) -> list[StoreOffer]:
         price = 900 if card.collector_number == "001" else 400
         return [offer(self.store_id, price)]
+
+
+class DelayedConnector(StoreConnector):
+    def __init__(self, store_id: str, delay_seconds: float) -> None:
+        self.store_id = store_id
+        self.store_name = store_id.title()
+        self.delay_seconds = delay_seconds
+        self.calls = 0
+
+    async def search(self, _: CardPrint) -> list[StoreOffer]:
+        self.calls += 1
+        await asyncio.sleep(self.delay_seconds)
+        return []
 
 
 def offer(
@@ -70,11 +84,30 @@ def test_comparison_sorts_prices_and_keeps_partial_results() -> None:
 def test_comparison_uses_cache_until_refreshed() -> None:
     connector = FixedConnector("only", [offer("only", 1000)])
     service = ComparisonService([connector])
-    asyncio.run(service.compare(CARD))
-    asyncio.run(service.compare(CARD))
+    first = asyncio.run(service.compare(CARD))
+    second = asyncio.run(service.compare(CARD))
+    assert not first.cached
+    assert second.cached
+    assert second.store_timings == first.store_timings
     assert connector.calls == 1
     asyncio.run(service.compare(CARD, refresh=True))
     assert connector.calls == 2
+
+
+def test_comparison_starts_every_store_concurrently_and_records_each_timing() -> None:
+    connectors = [DelayedConnector(f"store-{index}", 0.06) for index in range(3)]
+    started_at = monotonic()
+    result = asyncio.run(ComparisonService(connectors).compare(CARD))
+    elapsed = monotonic() - started_at
+
+    # Three serial 60 ms checks take about 180 ms. The service must preserve
+    # all three checks while completing on the slowest store instead.
+    assert elapsed < 0.15
+    assert [connector.calls for connector in connectors] == [1, 1, 1]
+    assert [timing.store_id for timing in result.store_timings] == ["store-0", "store-1", "store-2"]
+    assert all(timing.outcome == "no_active_listing" for timing in result.store_timings)
+    assert all(timing.elapsed_ms >= 50 for timing in result.store_timings)
+    assert result.duration_ms >= 50
 
 
 def test_comparison_reports_a_store_with_no_active_listing() -> None:

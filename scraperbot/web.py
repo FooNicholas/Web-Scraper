@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -50,6 +50,7 @@ from scraperbot.connectors.torecolo import TorecoloConnector
 from scraperbot.connectors.torecaplaza import TorecaPlazaConnector
 from scraperbot.connectors.vanhappy import VanHappyConnector
 from scraperbot.connectors.yuyutei import YuyuTeiConnector
+from scraperbot.connectors.base import use_shared_request_client
 from scraperbot.models import CardFamilyComparisonResult, CardPrint, ComparisonResult, StoreOffer, normalise_finish
 from scraperbot.query import parse_name_search_query
 from scraperbot.services.comparison import ComparisonService
@@ -225,6 +226,17 @@ class LocalPriceCheckWeb:
             "no_active_listing_stores": list(result.no_active_listing_stores),
             "unavailable_stores": list(result.unavailable_stores),
             "failed_stores": list(result.failed_stores),
+            "duration_ms": result.duration_ms,
+            "cached": result.cached,
+            "store_timings": [
+                {
+                    "store_id": timing.store_id,
+                    "store_name": timing.store_name,
+                    "outcome": timing.outcome,
+                    "elapsed_ms": timing.elapsed_ms,
+                }
+                for timing in result.store_timings
+            ],
         }
 
     @classmethod
@@ -262,10 +274,59 @@ class LocalPriceCheckWeb:
         }
 
 
+class AsyncOperationRunner:
+    """Run comparison work on one loop so browser selections reuse connections."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._ready = Event()
+        self._closed = False
+        self._client = None
+        self._thread = Thread(target=self._run_loop, name="jp-price-checker-requests", daemon=True)
+        self._thread.start()
+        self._ready.wait()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        self._loop.run_forever()
+
+    async def _run(self, operation: Any) -> Any:
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.AsyncClient(timeout=20, follow_redirects=True)
+        with use_shared_request_client(self._client):
+            return await operation
+
+    def run(self, operation: Any) -> Any:
+        if self._closed:
+            operation.close()
+            raise RuntimeError("The local web server is stopping.")
+        return asyncio.run_coroutine_threadsafe(self._run(operation), self._loop).result()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        async def close_client() -> None:
+            if self._client is not None:
+                await self._client.aclose()
+
+        try:
+            asyncio.run_coroutine_threadsafe(close_client(), self._loop).result(timeout=5)
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=5)
+            self._loop.close()
+
+
 class LocalWebRequestHandler(BaseHTTPRequestHandler):
     """Same-origin handler for the local browser UI."""
 
     application: LocalPriceCheckWeb
+    operation_runner: AsyncOperationRunner
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         request = urlsplit(self.path)
@@ -300,7 +361,7 @@ class LocalWebRequestHandler(BaseHTTPRequestHandler):
             try:
                 print_id = int(parameters.get("id", [""])[0])
                 refresh = parameters.get("refresh", ["0"])[0] == "1"
-                payload = asyncio.run(self.application.compare(print_id, refresh=refresh))
+                payload = self.operation_runner.run(self.application.compare(print_id, refresh=refresh))
             except ValueError:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "A valid card selection is required."})
             except LookupError as error:
@@ -317,7 +378,7 @@ class LocalWebRequestHandler(BaseHTTPRequestHandler):
             try:
                 print_id = int(parameters.get("id", [""])[0])
                 refresh = parameters.get("refresh", ["0"])[0] == "1"
-                payload = asyncio.run(self.application.compare_family(print_id, refresh=refresh))
+                payload = self.operation_runner.run(self.application.compare_family(print_id, refresh=refresh))
             except ValueError:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "A valid card selection is required."})
             except LookupError as error:
@@ -424,10 +485,31 @@ def build_web_application(settings: Settings | None = None) -> LocalPriceCheckWe
     return application
 
 
-def create_server(application: LocalPriceCheckWeb, *, host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
+class LocalWebServer(ThreadingHTTPServer):
+    """HTTP server that owns the reusable async request session."""
+
+    def __init__(self, address: tuple[str, int], handler: type[LocalWebRequestHandler], runner: AsyncOperationRunner) -> None:
+        self.operation_runner = runner
+        super().__init__(address, handler)
+
+    def server_close(self) -> None:
+        super().server_close()
+        self.operation_runner.close()
+
+
+def create_server(application: LocalPriceCheckWeb, *, host: str = "127.0.0.1", port: int = 8787) -> LocalWebServer:
     """Create a local-only HTTP server without beginning its request loop."""
-    handler = type("BoundLocalWebRequestHandler", (LocalWebRequestHandler,), {"application": application})
-    return ThreadingHTTPServer((host, port), handler)
+    runner = AsyncOperationRunner()
+    handler = type(
+        "BoundLocalWebRequestHandler",
+        (LocalWebRequestHandler,),
+        {"application": application, "operation_runner": runner},
+    )
+    try:
+        return LocalWebServer((host, port), handler, runner)
+    except Exception:
+        runner.close()
+        raise
 
 
 def serve(application: LocalPriceCheckWeb, *, host: str = "127.0.0.1", port: int = 8787) -> None:
@@ -511,6 +593,12 @@ INDEX_HTML = """<!doctype html>
     .comparison-actions { display:flex; align-items:center; gap:5px; }
     .comparison-actions button { margin-left:0; }
     .sort-icon { min-width:38px; font-size:1rem !important; line-height:1; letter-spacing:0; }
+    .check-timings { color:var(--muted); font-size:.82rem; border-bottom:1px solid var(--line); padding:10px 0 12px; margin-bottom:2px; }
+    .check-timings summary { cursor:pointer; color:var(--muted); }
+    .check-timings summary:hover { color:var(--accent-hover); }
+    .check-timing-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:5px 16px; list-style:none; padding:9px 0 0; margin:0; }
+    .check-timing-list li { display:flex; justify-content:space-between; gap:10px; }
+    .check-timing-list span:last-child { white-space:nowrap; }
     .offer { display:grid; grid-template-columns:minmax(110px,1fr) auto auto; gap:14px; align-items:center; padding:14px 0; border-bottom:1px solid var(--line); }
     .offer a { color:var(--ink); font-weight:750; text-decoration:none; }
     .offer a:hover { color:var(--accent-hover); }
@@ -553,9 +641,12 @@ function offerAvailabilityRank(offer) { return offer.availability==='in_stock' ?
 function sortedOffers(offers) { return [...offers].sort((left,right)=>{ const availability=offerAvailabilityRank(left)-offerAvailabilityRank(right); if (availability) return availability; const leftMissing=!Number.isInteger(left.price_yen), rightMissing=!Number.isInteger(right.price_yen); if (leftMissing!==rightMissing) return leftMissing ? 1 : -1; if (!leftMissing && left.price_yen!==right.price_yen) return offerSort==='highest' ? right.price_yen-left.price_yen : left.price_yen-right.price_yen; return left.store_name.localeCompare(right.store_name); }); }
 function renderCurrentComparison() { if (!currentComparison) return; comparisonMode==='aggregate' ? renderFamilyComparison(currentComparison) : renderComparison(currentComparison); }
 function offerSortControl() { const icon=document.createElement('button'); icon.type='button'; icon.className='sort-icon'; const lowest=offerSort==='lowest'; icon.textContent=lowest ? '☰↑' : '☰↓'; const current=lowest ? 'Lowest price' : 'Highest price', next=lowest ? 'highest' : 'lowest'; icon.title='Sorting displayed offers: '+current+'. Activate to sort '+next+' first.'; icon.setAttribute('aria-label',icon.title); icon.addEventListener('click',()=>{ offerSort=lowest ? 'highest' : 'lowest'; renderCurrentComparison(); }); return icon; }
-function renderComparison(data) { if (!data) return; currentComparison=data; comparisonMode='print'; highlightSelection(); clear(comparison); const head=document.createElement('div'); head.className='comparison-head'; const copy=document.createElement('div'); copy.append(text('h2',data.card.english_name),text('p',(data.card.japanese_name ? data.card.japanese_name+' · ' : '')+data.card.display_code)); const actions=document.createElement('div'); actions.className='comparison-actions'; actions.append(offerSortControl()); const refresh=document.createElement('button'); refresh.textContent='Refresh prices'; refresh.addEventListener('click',()=>compare(data.card.id,true)); actions.append(refresh); head.append(copy,actions); comparison.append(head); if (!data.offers.length) comparison.append(text('p','No active store listing is available for this printing right now.','notice')); for (const offer of sortedOffers(data.offers)) comparison.append(offerRow(offer)); const notices=[]; if (data.no_active_listing_stores.length) notices.push('No active listing (sold out or not stocked): '+data.no_active_listing_stores.join(', ')); if (data.unavailable_stores.length) notices.push('Set not listed: '+data.unavailable_stores.join(', ')); if (data.failed_stores.length) notices.push('Could not check: '+data.failed_stores.join(', ')); if (notices.length) comparison.append(text('p',notices.join(' · '),'notice')); }
+function elapsedLabel(milliseconds) { return milliseconds < 1000 ? milliseconds+' ms' : (milliseconds/1000).toFixed(milliseconds < 10000 ? 1 : 0)+' s'; }
+function comparisonStatus(data) { if (data.cached) return 'Showing a recent comparison from the last two minutes. Refresh prices to check stores again.'; return 'Checked '+(data.store_timings || []).length+' stores in '+elapsedLabel(data.duration_ms || 0)+'.'; }
+function appendStoreTimings(data) { const timings=data.store_timings || []; if (!timings.length) return; const details=document.createElement('details'); details.className='check-timings'; const summary=text('summary',(data.cached ? 'Recent result originally checked ' : 'Checked ')+timings.length+' stores in '+elapsedLabel(data.duration_ms || 0)+' — view timings'); details.append(summary); const list=document.createElement('ul'); list.className='check-timing-list'; const labels={offers:'offers found',no_active_listing:'no active listing',unavailable:'unavailable',failed:'could not check'}; for (const timing of [...timings].sort((left,right)=>right.elapsed_ms-left.elapsed_ms)) { const item=document.createElement('li'); item.append(text('span',timing.store_name),text('span',elapsedLabel(timing.elapsed_ms)+' · '+(labels[timing.outcome] || timing.outcome))); list.append(item); } details.append(list); comparison.append(details); }
+function renderComparison(data) { if (!data) return; currentComparison=data; comparisonMode='print'; highlightSelection(); clear(comparison); const head=document.createElement('div'); head.className='comparison-head'; const copy=document.createElement('div'); copy.append(text('h2',data.card.english_name),text('p',(data.card.japanese_name ? data.card.japanese_name+' · ' : '')+data.card.display_code)); const actions=document.createElement('div'); actions.className='comparison-actions'; actions.append(offerSortControl()); const refresh=document.createElement('button'); refresh.textContent='Refresh prices'; refresh.addEventListener('click',()=>compare(data.card.id,true)); actions.append(refresh); head.append(copy,actions); comparison.append(head); appendStoreTimings(data); if (!data.offers.length) comparison.append(text('p','No active store listing is available for this printing right now.','notice')); for (const offer of sortedOffers(data.offers)) comparison.append(offerRow(offer)); const notices=[]; if (data.no_active_listing_stores.length) notices.push('No active listing (sold out or not stocked): '+data.no_active_listing_stores.join(', ')); if (data.unavailable_stores.length) notices.push('Set not listed: '+data.unavailable_stores.join(', ')); if (data.failed_stores.length) notices.push('Could not check: '+data.failed_stores.join(', ')); if (notices.length) comparison.append(text('p',notices.join(' · '),'notice')); }
 function renderFamilyComparison(data) { if (!data) return; currentComparison=data; comparisonMode='aggregate'; highlightSelection(); clear(comparison); const head=document.createElement('div'); head.className='comparison-head'; const copy=document.createElement('div'); copy.append(text('h2','Aggregated card prints'),text('p',data.selected_card.english_name+' · '+data.print_count+' verified Japanese printings')); const actions=document.createElement('div'); actions.className='comparison-actions'; actions.append(offerSortControl()); const back=document.createElement('button'); back.textContent='Back to selected print'; back.addEventListener('click',()=>compare(data.selected_card.id)); actions.append(back); head.append(copy,actions); comparison.append(head); if (!data.offers.length) comparison.append(text('p','No store currently has a listed offer for these verified printings.','notice')); for (const offer of sortedOffers(data.offers)) comparison.append(offerRow(offer,offer.card.display_code)); }
-async function compare(id, refresh=false) { selectedId=id; highlightSelection(); setStatus('Checking stores…'); comparison.replaceChildren(text('p','Comparing listings…','notice')); try { const data=await readJson(await fetch('/api/compare?id='+encodeURIComponent(id)+(refresh?'&refresh=1':''))); renderComparison(data); setStatus(''); } catch (error) { clear(comparison); setStatus(error.message,true); } }
+async function compare(id, refresh=false) { selectedId=id; highlightSelection(); setStatus('Checking stores…'); comparison.replaceChildren(text('p','Comparing listings…','notice')); try { const data=await readJson(await fetch('/api/compare?id='+encodeURIComponent(id)+(refresh?'&refresh=1':''))); renderComparison(data); setStatus(comparisonStatus(data)); } catch (error) { clear(comparison); setStatus(error.message,true); } }
 async function compareFamily(id, refresh=false) { selectedId=id; currentComparison=null; comparisonMode=null; highlightSelection(); setStatus('Aggregating listings across card prints…'); comparison.replaceChildren(text('p','Comparing listings across verified printings…','notice')); try { const data=await readJson(await fetch('/api/compare-family?id='+encodeURIComponent(id)+(refresh?'&refresh=1':''))); renderFamilyComparison(data); setStatus(''); } catch (error) { clear(comparison); setStatus(error.message,true); } }
 form.addEventListener('submit',event=>{ event.preventDefault(); search(); }); document.querySelectorAll('[data-query]').forEach(button=>button.addEventListener('click',()=>search(button.dataset.query)));
 </script></body></html>"""
