@@ -91,10 +91,12 @@ Every fresh selected-print comparison starts all registered stores together;
 the result is complete only after every connector has returned an outcome.
 The browser shows the overall elapsed time and a collapsed per-store timing
 list. It keeps one HTTP client alive for the local app session, so a shopper
-moving through different cards can reuse existing connections. Product-detail
-connectors use `bounded_map` with `DETAIL_REQUEST_CONCURRENCY = 2`: this
-preserves every candidate in the existing per-store cap while avoiding the old
-serial detail-page wait and avoiding an aggressive same-store request burst.
+moving through different cards can reuse existing connections. Connectors with
+follow-up requests use `bounded_map` with `DETAIL_REQUEST_CONCURRENCY = 2`:
+this preserves every candidate in the existing per-store cap while avoiding the
+old serial detail-page wait and an aggressive same-store request burst. The
+limiter belongs to the connector, so an aggregate request cannot multiply that
+cap across several printings.
 
 Offers preserve price, availability, listed stock quantity when present,
 condition, raw finish text, and matching confidence. In-stock offers sort ahead
@@ -131,12 +133,12 @@ site exposes them. A connector must fail closed with `StoreUnavailableError`
 when a set is not listed, the response is overbroad, or a matching print cannot
 be verified.
 
-When a connector needs several detail pages after an already-bounded search,
-use `bounded_map` rather than a serial loop. Keep the existing candidate cap,
-preserve the returned order, and leave `DETAIL_REQUEST_CONCURRENCY` at two
-unless a new measured, permitted-store policy is reviewed. Do not omit a store
-from a comparison merely because it is slow; the timing data identifies the
-store for maintenance.
+When a connector needs several follow-up pages after an already-bounded search,
+use `bounded_map` with `semaphore=self.bounded_request_limiter()` rather than a
+serial loop. Keep the existing candidate cap, preserve the returned order, and
+leave `DETAIL_REQUEST_CONCURRENCY` at two unless a new measured,
+permitted-store policy is reviewed. Do not omit a store from a comparison
+merely because it is slow; the timing data identifies the store for maintenance.
 
 G-Project is the documented exception: its public catalogue does not expose a
 printed serial. Its connector is restricted to exact Japanese-name, set, and

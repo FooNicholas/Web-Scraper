@@ -68,7 +68,11 @@ class GProjectConnector(StoreConnector):
 
         return [
             offer
-            for offer in await bounded_map(listing_urls[: self._maximum_product_checks], inspect)
+            for offer in await bounded_map(
+                listing_urls[: self._maximum_product_checks],
+                inspect,
+                semaphore=self.bounded_request_limiter(),
+            )
             if offer
         ]
 

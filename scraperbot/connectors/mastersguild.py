@@ -49,7 +49,11 @@ class MastersGuildConnector(StoreConnector):
                 return None
             return self.parse_product_html(card, listing_url, detail.text)
 
-        return [offer for offer in await bounded_map(listings[:8], inspect) if offer]
+        return [
+            offer
+            for offer in await bounded_map(listings[:8], inspect, semaphore=self.bounded_request_limiter())
+            if offer
+        ]
 
     async def _get(self, url: str, *, params: dict[str, str] | None = None) -> httpx.Response:
         headers = {"User-Agent": "JP-Price-Checker/0.1 (+approved personal price comparison)"}

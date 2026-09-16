@@ -73,8 +73,8 @@ labelled as sold out rather than being discarded.
 
 All supported stores are checked for every fresh comparison. The app runs those
 checks together, keeps connections warm while the app is open, and limits only
-same-store product-detail requests to two at a time. This keeps comparisons
-complete while avoiding a burst of detail-page requests to one store.
+same-store follow-up requests to two at a time. This keeps comparisons complete
+while avoiding a burst of detail-page requests to one store.
 
 **Check catalogue update** updates card names, printings, mappings, and search
 data only. It never refreshes store prices and never makes your computer crawl

@@ -11,6 +11,7 @@ import httpx
 from scraperbot.connectors.base import (
     StoreConnector,
     StoreUnavailableError,
+    bounded_map,
     matches_card_finish,
     references_card,
     request_client,
@@ -66,11 +67,10 @@ class BigWebConnector(StoreConnector):
             )
         if page_count <= 1:
             return [first]
-        remaining = await asyncio.gather(
-            *(
-                self._get_json(f"{self.api_base_url}/products", params={**params, "page": page})
-                for page in range(2, page_count + 1)
-            )
+        remaining = await bounded_map(
+            list(range(2, page_count + 1)),
+            lambda page: self._get_json(f"{self.api_base_url}/products", params={**params, "page": page}),
+            semaphore=self.bounded_request_limiter(),
         )
         return [first, *remaining]
 

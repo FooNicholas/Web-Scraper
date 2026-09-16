@@ -51,7 +51,7 @@ class Net193Connector(StoreConnector):
                 return offer
             return self._with_detail_stock(offer, detail.text)
 
-        enriched = await bounded_map(offers[:8], enrich)
+        enriched = await bounded_map(offers[:8], enrich, semaphore=self.bounded_request_limiter())
         offers[: len(enriched)] = enriched
         return offers
 

@@ -40,6 +40,20 @@ class StoreConnector(ABC):
     async def search(self, card: CardPrint) -> list[StoreOffer]:
         """Return offers matched to exactly one selected card print."""
 
+    def bounded_request_limiter(self) -> asyncio.Semaphore:
+        """Return this store's session-wide limiter for bounded follow-up work.
+
+        An aggregate comparison can check several printings at once. Keeping
+        this semaphore on the connector rather than one `bounded_map` call
+        means those printings still share the same polite per-store cap.
+        Direct test calls on a different event loop receive a new semaphore.
+        """
+        loop = asyncio.get_running_loop()
+        if getattr(self, "_bounded_request_loop", None) is not loop:
+            self._bounded_request_loop = loop
+            self._bounded_request_semaphore = asyncio.Semaphore(DETAIL_REQUEST_CONCURRENCY)
+        return self._bounded_request_semaphore
+
 
 @contextmanager
 def use_shared_request_client(client: httpx.AsyncClient):
@@ -81,16 +95,17 @@ async def bounded_map(
     operation: Callable[[_Input], Awaitable[_Output]],
     *,
     concurrency: int = DETAIL_REQUEST_CONCURRENCY,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> list[_Output]:
-    """Run a bounded set of same-store detail requests without reordering it."""
+    """Run bounded requests without changing output order or dropping values."""
     if concurrency < 1:
         raise ValueError("Detail request concurrency must be at least one.")
     if not values:
         return []
-    semaphore = asyncio.Semaphore(concurrency)
+    limiter = semaphore or asyncio.Semaphore(concurrency)
 
     async def run(value: _Input) -> _Output:
-        async with semaphore:
+        async with limiter:
             return await operation(value)
 
     return list(await asyncio.gather(*(run(value) for value in values)))
