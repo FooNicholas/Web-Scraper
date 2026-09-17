@@ -1,7 +1,8 @@
 import asyncio
 from pathlib import Path
 from threading import Event, Thread
-from time import monotonic
+from time import monotonic, sleep
+from types import SimpleNamespace
 
 from scraperbot.catalogue.repository import CatalogueRepository
 from scraperbot.connectors.base import StoreConnector
@@ -185,6 +186,46 @@ def test_search_is_not_blocked_by_a_slow_store_comparison(tmp_path: Path) -> Non
             comparison_thread.join(timeout=2)
 
 
+def test_catalogue_rebuild_keeps_the_old_catalogue_live_until_a_staged_refresh_completes(tmp_path: Path) -> None:
+    database = tmp_path / "catalogue.sqlite3"
+    catalogue = CatalogueRepository(database)
+    catalogue.upsert(CardPrint("DZ-BT16", "001", "RRR", "Old Card", japanese_name="古いカード", source="test"))
+    entered_refresh = Event()
+    allow_refresh_to_finish = Event()
+
+    async def refresh_copy(path: Path, **kwargs: object) -> object:
+        assert kwargs["repair_regional"] is True
+        kwargs["progress"]("Reading approved catalogue sources…")  # type: ignore[operator]
+        entered_refresh.set()
+        assert await asyncio.to_thread(allow_refresh_to_finish.wait, 2)
+        with CatalogueRepository(path) as staged:
+            staged.upsert(
+                CardPrint("DZ-BT17", "001", "RRR", "New Card", japanese_name="新しいカード", source="test")
+            )
+        return SimpleNamespace(english_prints_imported=1, japanese_prints_imported=1, fandom_failed_sets=())
+
+    app = LocalPriceCheckWeb(catalogue, ComparisonService([]), catalogue_refresher=refresh_copy)
+    try:
+        assert app.start_catalogue_rebuild()["status"] == "running"
+        assert entered_refresh.wait(timeout=2)
+        assert app.search("old")["cards"]
+        assert not app.search("new")["cards"]
+
+        allow_refresh_to_finish.set()
+        deadline = monotonic() + 3
+        while app.catalogue_rebuild_status()["status"] == "running" and monotonic() < deadline:
+            sleep(0.01)
+
+        status = app.catalogue_rebuild_status()
+        assert status["status"] == "completed"
+        assert status["english_prints_imported"] == 1
+        assert app.search("new")["cards"]
+        assert app.search("old")["cards"]
+    finally:
+        allow_refresh_to_finish.set()
+        app.catalogue.close()
+
+
 def test_browser_ui_separates_print_aggregation_from_selected_print_sorting() -> None:
     assert "Aggregate card prints" in INDEX_HTML
     assert "Compare prices across " in INDEX_HTML
@@ -209,6 +250,13 @@ def test_browser_ui_only_checks_or_installs_catalogue_updates_after_a_user_actio
     assert "checkCatalogueUpdate" in INDEX_HTML
     assert "installCatalogueUpdate" in INDEX_HTML
     assert "fetch('/api/catalogue-update',{method:'POST',headers:{'X-JP-Price-Checker':'1'}})" in INDEX_HTML
+
+
+def test_browser_ui_offers_an_explicit_safe_catalogue_rebuild() -> None:
+    assert "Rebuild catalogue from sources" in INDEX_HTML
+    assert "Your current catalogue stays usable" in INDEX_HTML
+    assert "fetch('/api/catalogue-rebuild',{method:'POST',headers:{'X-JP-Price-Checker':'1'}})" in INDEX_HTML
+    assert "pollCatalogueRebuild" in INDEX_HTML
 
 
 def test_browser_ui_gives_each_desktop_panel_an_independent_scroll_container() -> None:

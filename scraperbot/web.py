@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import sqlite3
 from threading import Event, RLock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
+from scraperbot.catalogue.refresh import refresh_catalogue
 from scraperbot.catalogue.repository import CatalogueRepository
 from scraperbot.config import Settings
 from scraperbot.distribution import (
@@ -23,6 +28,7 @@ from scraperbot.distribution import (
     replace_catalogue_atomically,
     restore_previous_catalogue,
     seed_bundled_catalogue,
+    validate_catalogue_database,
 )
 from scraperbot.connectors.advantage import AdvantageConnector
 from scraperbot.connectors.bigweb import BigWebConnector
@@ -62,6 +68,26 @@ MAX_QUERY_LENGTH = 120
 MAX_CHOICES = 40
 
 
+@dataclass(slots=True)
+class _CatalogueRebuildState:
+    """Small, local-only status record for an explicitly requested rebuild."""
+
+    status: str = "idle"
+    message: str = ""
+    english_prints_imported: int | None = None
+    japanese_prints_imported: int | None = None
+    fandom_failed_sets: int | None = None
+
+    def payload(self) -> dict[str, object | None]:
+        return {
+            "status": self.status,
+            "message": self.message,
+            "english_prints_imported": self.english_prints_imported,
+            "japanese_prints_imported": self.japanese_prints_imported,
+            "fandom_failed_sets": self.fandom_failed_sets,
+        }
+
+
 class LocalPriceCheckWeb:
     """Application-facing operations used by the local HTTP handler."""
 
@@ -71,12 +97,18 @@ class LocalPriceCheckWeb:
         comparison: ComparisonService,
         *,
         update_client: CatalogueUpdateClient | None = None,
+        catalogue_refresher: Any = refresh_catalogue,
     ) -> None:
         self.catalogue = catalogue
         self.comparison = comparison
         self._catalogue_db = catalogue.path
         self._update_client = update_client
         self._catalogue_lock = RLock()
+        self._catalogue_refresher = catalogue_refresher
+        self._catalogue_rebuild_lock = RLock()
+        self._catalogue_rebuild = _CatalogueRebuildState()
+        self._catalogue_maintenance_lock = RLock()
+        self._catalogue_snapshot_update_active = False
 
     def search(
         self, raw_query: str, *, rarities: tuple[str, ...] = (), finishes: tuple[str, ...] = ()
@@ -161,42 +193,150 @@ class LocalPriceCheckWeb:
         """
         if not self._update_client or not self._update_client.enabled:
             raise CatalogueSnapshotError("Catalogue updates are not configured for this app build.")
-        snapshot = self._update_client.fetch_snapshot()
-        local = read_local_snapshot(self._catalogue_db)
-        if local and local.catalogue_version == snapshot.catalogue_version and local.sha256 == snapshot.sha256:
+        self._begin_catalogue_snapshot_update()
+        try:
+            snapshot = self._update_client.fetch_snapshot()
+            local = read_local_snapshot(self._catalogue_db)
+            if local and local.catalogue_version == snapshot.catalogue_version and local.sha256 == snapshot.sha256:
+                return {
+                    "enabled": True,
+                    "status": "up_to_date",
+                    "current_version": local.catalogue_version,
+                    "available_version": snapshot.catalogue_version,
+                    "generated_at": snapshot.generated_at,
+                }
+            staged = self._update_client.stage_snapshot(snapshot, self._catalogue_db.parent)
+            backup: Path | None = None
+            with self._catalogue_lock:
+                self.catalogue.close()
+                try:
+                    backup = replace_catalogue_atomically(staged, self._catalogue_db, snapshot)
+                    replacement = CatalogueRepository(self._catalogue_db)
+                except Exception:
+                    restore_previous_catalogue(self._catalogue_db, backup)
+                    # A restore might bring back an older database after its
+                    # version sidecar was already written. Remove the sidecar so
+                    # the next explicit check cannot mistake it for the new one.
+                    local_version_path(self._catalogue_db).unlink(missing_ok=True)
+                    self.catalogue = CatalogueRepository(self._catalogue_db)
+                    raise
+                else:
+                    self.catalogue = replacement
+                    self.comparison.invalidate()
+                    remove_catalogue_backup(backup)
             return {
                 "enabled": True,
-                "status": "up_to_date",
-                "current_version": local.catalogue_version,
+                "status": "updated",
+                "current_version": snapshot.catalogue_version,
                 "available_version": snapshot.catalogue_version,
                 "generated_at": snapshot.generated_at,
             }
-        staged = self._update_client.stage_snapshot(snapshot, self._catalogue_db.parent)
-        backup: Path | None = None
+        finally:
+            self._end_catalogue_snapshot_update()
+
+    def catalogue_rebuild_status(self) -> dict[str, object | None]:
+        """Return local progress without contacting any source or store."""
+        with self._catalogue_rebuild_lock:
+            return self._catalogue_rebuild.payload()
+
+    def start_catalogue_rebuild(self) -> dict[str, object | None]:
+        """Start one user-approved source rebuild on a staged database copy."""
+        with self._catalogue_maintenance_lock:
+            if self._catalogue_snapshot_update_active:
+                raise CatalogueSnapshotError("Wait for the published catalogue update to finish first.")
+            with self._catalogue_rebuild_lock:
+                if self._catalogue_rebuild.status == "running":
+                    return self._catalogue_rebuild.payload()
+                self._catalogue_rebuild = _CatalogueRebuildState(
+                    status="running",
+                    message="Preparing your current catalogue for a safe rebuild…",
+                )
+        Thread(target=self._run_catalogue_rebuild, name="jp-price-checker-catalogue-rebuild", daemon=True).start()
+        return self.catalogue_rebuild_status()
+
+    def _begin_catalogue_snapshot_update(self) -> None:
+        """Reserve the catalogue for one explicit published snapshot install."""
+        with self._catalogue_maintenance_lock:
+            if self._catalogue_snapshot_update_active:
+                raise CatalogueSnapshotError("A published catalogue update is already in progress.")
+            if self._catalogue_rebuild_is_running():
+                raise CatalogueSnapshotError("Wait for the catalogue rebuild from sources to finish first.")
+            self._catalogue_snapshot_update_active = True
+
+    def _end_catalogue_snapshot_update(self) -> None:
+        with self._catalogue_maintenance_lock:
+            self._catalogue_snapshot_update_active = False
+
+    def _catalogue_rebuild_is_running(self) -> bool:
+        with self._catalogue_rebuild_lock:
+            return self._catalogue_rebuild.status == "running"
+
+    def _set_catalogue_rebuild_message(self, message: str) -> None:
+        with self._catalogue_rebuild_lock:
+            if self._catalogue_rebuild.status == "running":
+                self._catalogue_rebuild.message = message
+
+    def _run_catalogue_rebuild(self) -> None:
+        staged = self._catalogue_db.with_name(f".{self._catalogue_db.name}.rebuild-{uuid4().hex}.sqlite3")
+        try:
+            self._set_catalogue_rebuild_message("Copying your current catalogue before contacting sources…")
+            with self._catalogue_lock:
+                destination = sqlite3.connect(staged)
+                try:
+                    self.catalogue.connection.backup(destination)
+                finally:
+                    destination.close()
+            result = asyncio.run(
+                self._catalogue_refresher(
+                    staged,
+                    repair_regional=True,
+                    progress=self._set_catalogue_rebuild_message,
+                )
+            )
+            validate_catalogue_database(staged)
+            self._set_catalogue_rebuild_message("Validating and installing the rebuilt catalogue…")
+            self._install_rebuilt_catalogue(staged)
+        except Exception as error:
+            staged.unlink(missing_ok=True)
+            with self._catalogue_rebuild_lock:
+                self._catalogue_rebuild.status = "failed"
+                self._catalogue_rebuild.message = f"Catalogue rebuild failed: {error}"
+        else:
+            with self._catalogue_rebuild_lock:
+                self._catalogue_rebuild = _CatalogueRebuildState(
+                    status="completed",
+                    message="Catalogue rebuilt from approved sources. Search again to use the updated card list.",
+                    english_prints_imported=result.english_prints_imported,
+                    japanese_prints_imported=result.japanese_prints_imported,
+                    fandom_failed_sets=len(result.fandom_failed_sets),
+                )
+
+    def _install_rebuilt_catalogue(self, staged: Path) -> None:
+        """Replace the live database only after a full staged rebuild succeeds."""
+        backup = self._catalogue_db.with_name(f".{self._catalogue_db.name}.rebuild-previous")
         with self._catalogue_lock:
+            backup.unlink(missing_ok=True)
             self.catalogue.close()
+            moved_existing = False
             try:
-                backup = replace_catalogue_atomically(staged, self._catalogue_db, snapshot)
-                replacement = CatalogueRepository(self._catalogue_db)
-            except Exception:
-                restore_previous_catalogue(self._catalogue_db, backup)
-                # A restore might bring back an older database after its
-                # version sidecar was already written. Remove the sidecar so
-                # the next explicit check cannot mistake it for the new one.
+                if self._catalogue_db.exists():
+                    os.replace(self._catalogue_db, backup)
+                    moved_existing = True
+                os.replace(staged, self._catalogue_db)
+                # This database is locally rebuilt, rather than a particular
+                # signed release snapshot. A later user-approved release can
+                # still supersede it normally.
                 local_version_path(self._catalogue_db).unlink(missing_ok=True)
+                self.catalogue = CatalogueRepository(self._catalogue_db)
+            except Exception:
+                if moved_existing and backup.exists():
+                    self._catalogue_db.unlink(missing_ok=True)
+                    os.replace(backup, self._catalogue_db)
                 self.catalogue = CatalogueRepository(self._catalogue_db)
                 raise
             else:
-                self.catalogue = replacement
                 self.comparison.invalidate()
-                remove_catalogue_backup(backup)
-        return {
-            "enabled": True,
-            "status": "updated",
-            "current_version": snapshot.catalogue_version,
-            "available_version": snapshot.catalogue_version,
-            "generated_at": snapshot.generated_at,
-        }
+                backup.unlink(missing_ok=True)
 
     @staticmethod
     def _card_payload(card: CardPrint) -> dict[str, Any]:
@@ -338,6 +478,9 @@ class LocalWebRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         parameters = parse_qs(request.query, keep_blank_values=True)
+        if request.path == "/api/catalogue-rebuild":
+            self._send_json(HTTPStatus.OK, self.application.catalogue_rebuild_status())
+            return
         if request.path == "/api/catalogue-update":
             try:
                 self._send_json(HTTPStatus.OK, self.application.catalogue_update_status())
@@ -395,6 +538,15 @@ class LocalWebRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         request = urlsplit(self.path)
+        if request.path == "/api/catalogue-rebuild":
+            if self.headers.get("X-JP-Price-Checker") != "1":
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "Catalogue rebuilds must be started from this app."})
+                return
+            try:
+                self._send_json(HTTPStatus.ACCEPTED, self.application.start_catalogue_rebuild())
+            except CatalogueSnapshotError as error:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+            return
         if request.path == "/api/catalogue-update":
             if self.headers.get("X-JP-Price-Checker") != "1":
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "Catalogue updates must be started from this app."})
@@ -615,10 +767,10 @@ INDEX_HTML = """<!doctype html>
   <p class="intro">Search by English card name / Japanese serial number</p>
   <form id="search-form"><input id="query" type="search" maxlength="120" autocomplete="off" placeholder="Try: Youthberk, D-PR/953" autofocus><button id="search-button">Search</button></form>
   <div class="hint">Optional rarity at the end: <button type="button" data-query="Youthberk FFR">Youthberk FFR</button><button type="button" data-query="D-PR/953">D-PR/953</button></div>
-  <div class="catalogue-tools"><button type="button" id="catalogue-update-button">Check catalogue update</button><span id="catalogue-update-status" aria-live="polite"></span></div>
+  <div class="catalogue-tools"><button type="button" id="catalogue-update-button">Check catalogue update</button><span id="catalogue-update-status" aria-live="polite"></span><button type="button" id="catalogue-rebuild-button">Rebuild catalogue from sources</button><span id="catalogue-rebuild-status" aria-live="polite"></span></div>
   <div id="status" aria-live="polite"></div><section id="filters" class="filters" aria-label="Filter matching printings" hidden></section><div class="workspace"><section class="print-panel"><p class="panel-label">Matching printings</p><section id="results" class="result-list"></section></section><section class="price-panel"><p class="panel-label">Price comparison</p><section id="comparison"></section></section></div>
 </main><script>
-const query = document.querySelector('#query'), form = document.querySelector('#search-form'), searchButton = document.querySelector('#search-button'), status = document.querySelector('#status'), filters = document.querySelector('#filters'), results = document.querySelector('#results'), comparison = document.querySelector('#comparison'), catalogueUpdateButton = document.querySelector('#catalogue-update-button'), catalogueUpdateStatus = document.querySelector('#catalogue-update-status');
+const query = document.querySelector('#query'), form = document.querySelector('#search-form'), searchButton = document.querySelector('#search-button'), status = document.querySelector('#status'), filters = document.querySelector('#filters'), results = document.querySelector('#results'), comparison = document.querySelector('#comparison'), catalogueUpdateButton = document.querySelector('#catalogue-update-button'), catalogueUpdateStatus = document.querySelector('#catalogue-update-status'), catalogueRebuildButton = document.querySelector('#catalogue-rebuild-button'), catalogueRebuildStatus = document.querySelector('#catalogue-rebuild-status');
 let selectedId = null, searchCards = [], activeRarities = new Set(), activeFinishes = new Set(), currentComparison = null, comparisonMode = null, offerSort = 'lowest';
 function setStatus(message, isError=false) { status.textContent = message; status.className = isError ? 'error' : ''; }
 function clear(node) { node.replaceChildren(); }
@@ -634,6 +786,11 @@ function showCatalogueStatus(message, isError=false) { catalogueUpdateStatus.tex
 async function checkCatalogueUpdate() { catalogueUpdateButton.disabled=true; showCatalogueStatus('Checking published catalogue…'); try { const data=await readJson(await fetch('/api/catalogue-update')); if (!data.enabled) { catalogueUpdateButton.hidden=true; showCatalogueStatus('Catalogue updates are included with this app release.'); return; } if (data.status==='up_to_date') { catalogueUpdateButton.textContent='Catalogue is current'; showCatalogueStatus('Version '+data.current_version+' is already installed.'); return; } catalogueUpdateButton.textContent='Install catalogue update'; catalogueUpdateButton.dataset.availableVersion=data.available_version || ''; showCatalogueStatus('Version '+(data.available_version || 'new')+' is ready. Installing replaces only your local card catalogue.'); } catch (error) { showCatalogueStatus(error.message,true); } finally { catalogueUpdateButton.disabled=false; } }
 async function installCatalogueUpdate() { const version=catalogueUpdateButton.dataset.availableVersion || 'this'; if (!window.confirm('Install catalogue version '+version+'? Your card mappings will update, but no store prices are saved.')) return; catalogueUpdateButton.disabled=true; showCatalogueStatus('Downloading and checking catalogue…'); try { const data=await readJson(await fetch('/api/catalogue-update',{method:'POST',headers:{'X-JP-Price-Checker':'1'}})); if (data.status==='updated') { catalogueUpdateButton.textContent='Catalogue is current'; delete catalogueUpdateButton.dataset.availableVersion; showCatalogueStatus('Catalogue version '+data.current_version+' is now installed.'); } else { catalogueUpdateButton.textContent='Catalogue is current'; showCatalogueStatus('Version '+data.current_version+' is already installed.'); } } catch (error) { showCatalogueStatus(error.message,true); } finally { catalogueUpdateButton.disabled=false; } }
 catalogueUpdateButton.addEventListener('click',()=>catalogueUpdateButton.dataset.availableVersion ? installCatalogueUpdate() : checkCatalogueUpdate());
+function showCatalogueRebuildStatus(message, isError=false) { catalogueRebuildStatus.textContent=message; catalogueRebuildStatus.style.color=isError ? 'var(--danger)' : ''; }
+function renderCatalogueRebuildStatus(data) { const running=data.status==='running'; catalogueRebuildButton.disabled=running; catalogueRebuildButton.textContent=running ? 'Rebuilding catalogue…' : 'Rebuild catalogue from sources'; let message=data.message || ''; if (data.status==='completed') { const imported=(data.english_prints_imported || 0)+(data.japanese_prints_imported || 0); message+=(imported ? ' Imported '+imported+' new catalogue print'+(imported===1?'':'s')+'.' : ' No newly published prints were found.'); if (data.fandom_failed_sets) message+=' '+data.fandom_failed_sets+' Fandom mapping page'+(data.fandom_failed_sets===1?' needs':'s need')+' review.'; } showCatalogueRebuildStatus(message,data.status==='failed'); return running; }
+async function pollCatalogueRebuild() { try { const running=renderCatalogueRebuildStatus(await readJson(await fetch('/api/catalogue-rebuild'))); if (running) window.setTimeout(pollCatalogueRebuild,2500); } catch (error) { showCatalogueRebuildStatus(error.message,true); catalogueRebuildButton.disabled=false; } }
+async function startCatalogueRebuild() { if (!window.confirm('Rebuild your local catalogue from approved official, Fandom and Yuyu-Tei sources? This can take several minutes and uses your internet, but does not check store prices. Your current catalogue stays usable until the rebuilt copy is ready.')) return; catalogueRebuildButton.disabled=true; showCatalogueRebuildStatus('Starting catalogue rebuild…'); try { const data=await readJson(await fetch('/api/catalogue-rebuild',{method:'POST',headers:{'X-JP-Price-Checker':'1'}})); if (renderCatalogueRebuildStatus(data)) window.setTimeout(pollCatalogueRebuild,2500); } catch (error) { showCatalogueRebuildStatus(error.message,true); catalogueRebuildButton.disabled=false; } }
+catalogueRebuildButton.addEventListener('click',startCatalogueRebuild); pollCatalogueRebuild();
 function safeLink(url) { try { const parsed=new URL(url); return ['https:','http:'].includes(parsed.protocol) ? parsed.href : null; } catch { return null; } }
 function highlightSelection() { document.querySelectorAll('.card[data-print-id]').forEach(card=>card.classList.toggle('active',Number(card.dataset.printId)===selectedId)); }
 function offerRow(offer, printLabel='') { const row=document.createElement('div'); row.className='offer'; const store=document.createElement(offer.listing_url ? 'a' : 'div'); store.textContent=(printLabel ? printLabel+' · ' : '')+offer.store_name+(offer.condition ? ' · '+offer.condition : ''); if (offer.listing_url) { const href=safeLink(offer.listing_url); if (href) { store.href=href; store.target='_blank'; store.rel='noopener noreferrer'; } } const detail=text('small',offer.raw_name); const storeWrap=document.createElement('div'); storeWrap.append(store,detail); const stock=Number.isInteger(offer.stock_count) ? offer.stock_count+' left' : offer.availability==='sold_out' ? '×' : offer.availability==='in_stock' ? '◯' : '?'; const finish=offer.finish_raw || (offer.finish==='holo' ? 'Holo' : offer.finish==='standard' ? 'Standard' : ''); const tags=[stock,finish].filter(Boolean).join(' · '); row.append(storeWrap,text('div',offer.price_display,offer.availability==='in_stock'?'price':'sold'),text('div',tags,'tag')); return row; }

@@ -16,7 +16,9 @@ The product is deliberately local-first:
 - Telegram is optional and uses local long polling when a maintainer supplies
   a private bot token.
 - The curated SQLite catalogue is local. Desktop downloads receive a reviewed
-  snapshot rather than scraping the catalogue on first launch.
+  snapshot rather than scraping the catalogue on first launch. Users can also
+  explicitly choose a staged, approved-source rebuild from the browser; it is
+  never automatic.
 - Price lookups happen only after the user chooses a print or explicitly
   aggregates a card's prints. They are not catalogue-refresh jobs.
 
@@ -47,6 +49,7 @@ English name / Japanese serial
 | Price comparison | `scraperbot/services/comparison.py` | Starts every connector concurrently, records each outcome and elapsed time, and keeps a 120-second in-memory result cache. |
 | Store connectors | `scraperbot/connectors/` | Performs bounded public lookup of one selected Japanese print at a time. The browser shares a warm HTTP session between selected cards. |
 | Distribution | `scraperbot/distribution.py`, `scraperbot/catalogue_snapshot.py` | Builds, verifies, seeds, checks, and atomically installs SQLite catalogue snapshots. |
+| Local source rebuild | `scraperbot/web.py`, `scraperbot/catalogue/refresh.py` | On explicit browser approval, copies the local SQLite catalogue, refreshes the copy from approved sources, validates it, then atomically swaps it in. |
 | Native packaging | `scripts/build_desktop.py`, `.github/workflows/build-desktop-downloads.yml` | Packages matching Apple-silicon macOS and Windows x64 builds and attaches them to a GitHub Release draft. |
 
 ### Data model and equality rule
@@ -221,6 +224,17 @@ snapshot. The update is HTTPS-only, checked against a SHA-256 digest, validated
 as the expected SQLite schema, and atomically replaced; a failed update keeps
 the prior database.
 
+They may alternatively choose **Rebuild catalogue from sources** in the local
+app. That action has a confirmation prompt, copies the existing database to a
+staged SQLite file, runs the same approved-source refresh used by maintainers,
+validates the result, and swaps it in only after success. It does not query
+price stores. The browser polls only the local status endpoint while the
+rebuild runs; it does not silently start, retry, or schedule source traffic.
+The app prevents a snapshot update and a source rebuild from running at the
+same time. If an official Japanese print exists before an approved English-name
+mapping source exists, the rebuilt catalogue keeps it Japanese-serial-searchable
+without inventing an English mapping.
+
 ### Release process
 
 1. Refresh, test, and review the local catalogue.
@@ -261,7 +275,7 @@ token to a release.
 | Japanese canonical names determine identity | Prevents regional serial collisions and wrong reprint grouping | Some legitimate promos remain serial-only until direct mapping evidence exists. |
 | English names are search mappings | English-name discovery works without pretending English prints are Japanese prints | English names do not establish card equality. |
 | Exact-print retailer checks | Strong protection against price being attributed to the wrong rarity or foil | Stores without serials cannot be supported safely, except the documented G-Project constraint. |
-| Local snapshot instead of per-user catalogue crawl | Predictable startup, low retailer/source traffic, and shared curated data | A curator must refresh and publish catalogue updates. |
+| Curated snapshot plus opt-in local source rebuild | Predictable startup and a reviewed default, while letting users add newly released official cards themselves | A source rebuild can take minutes and may leave newly Japanese-only cards serial-searchable until direct English-name evidence exists. |
 | Local browser server | No hosting bill, credentials, or exposed public service | Friends run a desktop process and view it in their own browser. |
 | Manual price refresh with short cache | Avoids repeatedly hitting every store while browsing | Results are a point-in-time comparison, not a persistent price history. |
 
@@ -272,7 +286,7 @@ token to a release.
 | Work | Next action |
 | --- | --- |
 | First public desktop release | Test the generated Mac and Windows archives, complete platform signing/notarization, then publish the release. |
-| Catalogue upkeep | Run an opt-in refresh when new sets or promos arrive; resolve only mappings with direct evidence. |
+| Catalogue upkeep | Publish reviewed snapshots for most users; keep the explicit local rebuild available when a new set or promo arrives, and resolve only mappings with direct evidence. |
 | Promo review backlog | Review playable Japanese promos that remain unmapped. Utility cards stay serial-only by design. |
 | Connector health | Periodically run fixture tests and live spot checks; adjust parsers only when the public storefront changes. |
 | Slow-store investigation | Use the in-app timing list after normal shopper sessions to identify persistent outliers before changing a connector's query or parser. |
@@ -300,6 +314,8 @@ token to a release.
   connections, and bounded two-at-a-time product-detail retrieval.
 - Versioned, verified catalogue snapshots and native Apple-silicon/Windows
   packaging workflow.
+- Explicit, staged local catalogue rebuild with confirmation, progress, source
+  failure visibility, validation, and rollback-safe replacement.
 
 ## Verification checklist
 

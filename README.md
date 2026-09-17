@@ -77,10 +77,24 @@ same-store follow-up requests to two at a time. This keeps comparisons complete
 while avoiding a burst of detail-page requests to one store.
 
 **Check catalogue update** updates card names, printings, mappings, and search
-data only. It never refreshes store prices and never makes your computer crawl
-the official catalogue, Fandom, or retailer sites. You see the incoming
-catalogue version and must approve the update before it replaces your local
-copy.
+data only. It never refreshes store prices and never contacts the catalogue
+sources. You see the incoming curator-published catalogue version and must
+approve the update before it replaces your local copy.
+
+### Rebuild your own catalogue
+
+When a new Japanese set is released, you can choose **Rebuild catalogue from
+sources**. The app clearly asks first, then makes a working copy of your local
+catalogue and refreshes it from the approved official catalogues, Fandom name
+mappings, and the Yuyu-Tei promo directory. It can take several minutes; it
+does not check price stores, and the current catalogue remains usable until the
+new copy has been checked and installed.
+
+This is optional. **Check catalogue update** is faster and uses the reviewed
+release snapshot. A newly published Japanese-only print is searchable by its
+Japanese serial as soon as the official catalogue has it. English-name search
+becomes available once there is direct mapping evidence; the app does not guess
+translations or equate English and Japanese serial numbers.
 
 ## Stores and limitations
 
