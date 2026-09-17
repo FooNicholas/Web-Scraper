@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from scraperbot.catalogue.japanese_source import OfficialJapaneseCardSource
-from scraperbot.catalogue.official_source import OfficialSourceError
+from scraperbot.catalogue.official_source import OfficialExpansion, OfficialSourceError
 from scraperbot.catalogue.repository import CatalogueRepository
 from scraperbot.models import JapaneseCardPrint
 
@@ -17,14 +17,15 @@ def current_standard_expansions(expansions: list[OfficialExpansion]) -> list[Off
     """Keep D/DZ-era product pages, excluding V-series and older formats.
 
     Bushiroad's public catalogue gives D-SD01 the product id 201 and current
-    D/DZ products ids through 300. Annual PR pages use a four-digit year, so
-    2021 onward remains part of the current Standard-format catalogue while
-    the 2020 V-era PR page stays excluded.
+    D/DZ product IDs occupy the three-digit range starting at 201 and continue
+    to grow as new products are published. Annual PR pages use a four-digit
+    year, so 2021 onward remains part of the current Standard-format catalogue
+    while the 2020 V-era PR page stays excluded.
     """
     return [
         expansion
         for expansion in expansions
-        if 201 <= expansion.id <= 300 or expansion.id >= 2021
+        if 201 <= expansion.id < 1000 or expansion.id >= 2021
     ]
 
 

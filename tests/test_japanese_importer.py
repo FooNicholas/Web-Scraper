@@ -50,11 +50,12 @@ def test_current_standard_expansions_excludes_v_era_prs() -> None:
             OfficialExpansion(190, "V-BT01", "V-series"),
             OfficialExpansion(201, "D-SD01", "D-series"),
             OfficialExpansion(300, "DZ-BT16", "DZ-series"),
+            OfficialExpansion(301, "DZ-SS19", "Current DZ Special Series"),
             OfficialExpansion(2020, None, "2020 PR"),
             OfficialExpansion(2021, None, "2021 PR"),
         ]
     )
-    assert [expansion.id for expansion in selected] == [201, 300, 2021]
+    assert [expansion.id for expansion in selected] == [201, 300, 301, 2021]
 
 
 def test_current_standard_prints_exclude_legacy_promo_codes() -> None:
