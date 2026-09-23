@@ -11,8 +11,7 @@ extension.
 
 ## Get the app
 
-Open this project's **Releases** page and download the archive for your
-computer:
+Download the latest archive from the [GitHub Releases page](https://github.com/FooNicholas/Web-Scraper/releases), then choose the file for your computer:
 
 | Computer | Download | Open it |
 | --- | --- | --- |
