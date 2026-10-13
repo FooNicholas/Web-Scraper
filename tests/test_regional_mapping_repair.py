@@ -121,6 +121,25 @@ def test_new_official_special_set_import_is_archived_not_searchable(tmp_path: Pa
         assert archived["english_name"] == "Vital Blaze Blast"
 
 
+def test_special_set_repair_keeps_verified_card_page_evidence(tmp_path: Path) -> None:
+    database = tmp_path / "catalogue.sqlite3"
+    with CatalogueRepository(database) as catalogue:
+        catalogue.import_japanese_many(
+            [JapaneseCardPrint("DZ-SS10", "018", "", "ケッパー・コンパニオン", "https://jp/018")]
+        )
+        catalogue.apply_name_mappings(
+            [EnglishNameMapping("DZ-SS10", "018", "", "Verified Caper Companion",
+                                "fandom-cross-print", "https://wiki/card", status="verified")]
+        )
+
+    asyncio.run(repair_region_specific_mappings(database, ("DZ-SS10",), source=FixedFandomSource()))
+
+    with CatalogueRepository(database) as catalogue:
+        assert {card.english_name for card in catalogue.search("caper companion", japanese_only=True)} == {
+            "Verified Caper Companion"
+        }
+
+
 def test_japanese_promo_section_repairs_conflicting_regional_serials(tmp_path: Path) -> None:
     database = tmp_path / "catalogue.sqlite3"
     with CatalogueRepository(database) as catalogue:

@@ -112,3 +112,40 @@ def test_reviewed_english_name_survives_unchanged_official_identity_and_repair(t
 def test_missing_official_table_is_not_an_empty_success():
     with pytest.raises(OfficialSourceError):
         OfficialPromoSource.parse_page('<html>Temporarily unavailable</html>')
+
+
+def test_current_official_pr_api_fallback_preserves_scheduled_and_released_rows():
+    requests = []
+
+    def respond(request):
+        requests.append((request.url.path, request.url.params.get('page', '1')))
+        if request.url.path == '/cardlist/card_pr':
+            return httpx.Response(200, text='<html><div id="pwocg-card-pr"></div></html>')
+        assert request.url.path == '/manage/card-pr-user/list'
+        page = int(request.url.params['page'])
+        return httpx.Response(200, json={
+            'page': page, 'pages': 2,
+            'scheduled': [{
+                'card_number': 'D-PR/2000', 'card_name': '未来のカード',
+                'card_use': '2026/10/17', 'dist_way': 'Event',
+            }],
+            'items': ([{'card_number': 'D-PR/953', 'card_name': '大地を駆ける守主 ルアン',
+                       'dist_way': 'PR Pack'}] if page == 1 else
+                      [{'card_number': 'D-PR/2000', 'card_name': '未来のカード',
+                        'dist_way': 'PR Pack'}]),
+        })
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await OfficialPromoSource(client, page_delay=0).fetch()
+
+    entries = asyncio.run(run())
+    assert requests == [('/cardlist/card_pr', '1'), ('/manage/card-pr-user/list', '1'),
+                        ('/manage/card-pr-user/list', '2')]
+    assert {entry.card.collector_number for entry in entries} == {'953', '2000'}
+    assert next(entry for entry in entries if entry.card.collector_number == '2000').available_from is None
+
+
+def test_invalid_official_pr_api_page_is_not_accepted():
+    with pytest.raises(OfficialSourceError):
+        OfficialPromoSource.parse_api_page({'items': [], 'page': 1, 'pages': 0})

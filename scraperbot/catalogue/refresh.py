@@ -33,6 +33,7 @@ class CatalogueRefreshResult:
     """Summary of a completed refresh from approved catalogue sources."""
 
     english_prints_imported: int
+    english_source_error: str | None
     japanese_prints_imported: int
     official_promo_identities: int
     official_link_candidates: int
@@ -69,15 +70,21 @@ async def refresh_catalogue(
     """
     report = progress or (lambda _: None)
     report("Refreshing official English catalogue…")
-    english_prints = await official_importer(
-        database,
-        [],
-        all_sets=True,
-        progress=lambda index, total, label, count: report(
-            f"English [{index}/{total}] {label}: "
-            f"{'already imported' if count is None else f'{count} prints'}"
-        ),
-    )
+    english_source_error = None
+    try:
+        english_prints = await official_importer(
+            database,
+            [],
+            all_sets=True,
+            progress=lambda index, total, label, count: report(
+                f"English [{index}/{total}] {label}: "
+                f"{'already imported' if count is None else f'{count} prints'}"
+            ),
+        )
+    except OfficialSourceError as error:
+        english_prints = 0
+        english_source_error = str(error)
+        report(f"Official English catalogue unavailable: {error}. Continuing with Japanese and Fandom sources…")
     report("Refreshing official Japanese catalogue…")
     japanese_prints = await japanese_importer(
         database,
@@ -128,6 +135,7 @@ async def refresh_catalogue(
     promo_mapping_repairer(database)
     return CatalogueRefreshResult(
         english_prints_imported=int(english_prints),
+        english_source_error=english_source_error,
         japanese_prints_imported=int(japanese_prints),
         official_promo_identities=int(official_promos),
         official_link_candidates=link_candidates,
@@ -188,6 +196,8 @@ def main() -> None:
     )
     if result.fandom_failed_sets:
         print("Fandom pages needing review: " + ", ".join(result.fandom_failed_sets))
+    if result.english_source_error:
+        print("Official English catalogue could not be refreshed: " + result.english_source_error)
     if result.regional_repair:
         print(
             f"Regional rebuild: {result.regional_repair.unresolved} playable print(s) still unmapped; "

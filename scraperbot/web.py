@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import closing
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,7 @@ from uuid import uuid4
 
 from scraperbot.catalogue.refresh import refresh_catalogue
 from scraperbot.catalogue.repository import CatalogueRepository
+from scraperbot.catalogue.status import catalogue_status
 from scraperbot.config import Settings
 from scraperbot.distribution import (
     CatalogueSnapshotError,
@@ -75,16 +77,28 @@ class _CatalogueRebuildState:
     status: str = "idle"
     message: str = ""
     english_prints_imported: int | None = None
+    english_source_error: str | None = None
     japanese_prints_imported: int | None = None
     fandom_failed_sets: int | None = None
+    searchable_japanese_prints: int | None = None
+    japanese_prints: int | None = None
+    searchable_change: int | None = None
+    new_set_coverage: tuple[dict[str, str | int], ...] = ()
+    fandom_failed_set_codes: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, object | None]:
         return {
             "status": self.status,
             "message": self.message,
             "english_prints_imported": self.english_prints_imported,
+            "english_source_error": self.english_source_error,
             "japanese_prints_imported": self.japanese_prints_imported,
             "fandom_failed_sets": self.fandom_failed_sets,
+            "searchable_japanese_prints": self.searchable_japanese_prints,
+            "japanese_prints": self.japanese_prints,
+            "searchable_change": self.searchable_change,
+            "new_set_coverage": self.new_set_coverage,
+            "fandom_failed_set_codes": self.fandom_failed_set_codes,
         }
 
 
@@ -286,6 +300,11 @@ class LocalPriceCheckWeb:
                     self.catalogue.connection.backup(destination)
                 finally:
                     destination.close()
+            before = catalogue_status(staged)
+            with closing(sqlite3.connect(staged)) as connection:
+                previous_set_codes = {
+                    str(row[0]) for row in connection.execute("SELECT DISTINCT set_code FROM japanese_prints")
+                }
             result = asyncio.run(
                 self._catalogue_refresher(
                     staged,
@@ -294,6 +313,24 @@ class LocalPriceCheckWeb:
                 )
             )
             validate_catalogue_database(staged)
+            after = catalogue_status(staged)
+            with closing(sqlite3.connect(staged)) as connection:
+                new_set_coverage = tuple(
+                    {
+                        "set_code": str(row[0]),
+                        "japanese_prints": int(row[1]),
+                        "searchable_japanese_prints": int(row[2]),
+                    }
+                    for row in connection.execute(
+                        """
+                        SELECT j.set_code, COUNT(*), COUNT(l.japanese_print_id)
+                        FROM japanese_prints AS j
+                        LEFT JOIN japanese_print_identity_links AS l ON l.japanese_print_id = j.id
+                        GROUP BY j.set_code ORDER BY j.set_code
+                        """
+                    )
+                    if str(row[0]) not in previous_set_codes
+                )
             self._set_catalogue_rebuild_message("Validating and installing the rebuilt catalogue…")
             self._install_rebuilt_catalogue(staged)
         except Exception as error:
@@ -307,8 +344,14 @@ class LocalPriceCheckWeb:
                     status="completed",
                     message="Catalogue rebuilt from approved sources. Search again to use the updated card list.",
                     english_prints_imported=result.english_prints_imported,
+                    english_source_error=getattr(result, "english_source_error", None),
                     japanese_prints_imported=result.japanese_prints_imported,
                     fandom_failed_sets=len(result.fandom_failed_sets),
+                    searchable_japanese_prints=after.searchable_japanese_prints,
+                    japanese_prints=after.japanese_prints,
+                    searchable_change=after.searchable_japanese_prints - before.searchable_japanese_prints,
+                    new_set_coverage=new_set_coverage,
+                    fandom_failed_set_codes=tuple(result.fandom_failed_sets),
                 )
 
     def _install_rebuilt_catalogue(self, staged: Path) -> None:
@@ -787,7 +830,32 @@ async function checkCatalogueUpdate() { catalogueUpdateButton.disabled=true; sho
 async function installCatalogueUpdate() { const version=catalogueUpdateButton.dataset.availableVersion || 'this'; if (!window.confirm('Install catalogue version '+version+'? Your card mappings will update, but no store prices are saved.')) return; catalogueUpdateButton.disabled=true; showCatalogueStatus('Downloading and checking catalogue…'); try { const data=await readJson(await fetch('/api/catalogue-update',{method:'POST',headers:{'X-JP-Price-Checker':'1'}})); if (data.status==='updated') { catalogueUpdateButton.textContent='Catalogue is current'; delete catalogueUpdateButton.dataset.availableVersion; showCatalogueStatus('Catalogue version '+data.current_version+' is now installed.'); } else { catalogueUpdateButton.textContent='Catalogue is current'; showCatalogueStatus('Version '+data.current_version+' is already installed.'); } } catch (error) { showCatalogueStatus(error.message,true); } finally { catalogueUpdateButton.disabled=false; } }
 catalogueUpdateButton.addEventListener('click',()=>catalogueUpdateButton.dataset.availableVersion ? installCatalogueUpdate() : checkCatalogueUpdate());
 function showCatalogueRebuildStatus(message, isError=false) { catalogueRebuildStatus.textContent=message; catalogueRebuildStatus.style.color=isError ? 'var(--danger)' : ''; }
-function renderCatalogueRebuildStatus(data) { const running=data.status==='running'; catalogueRebuildButton.disabled=running; catalogueRebuildButton.textContent=running ? 'Rebuilding catalogue…' : 'Rebuild catalogue from sources'; let message=data.message || ''; if (data.status==='completed') { const imported=(data.english_prints_imported || 0)+(data.japanese_prints_imported || 0); message+=(imported ? ' Imported '+imported+' new catalogue print'+(imported===1?'':'s')+'.' : ' No newly published prints were found.'); if (data.fandom_failed_sets) message+=' '+data.fandom_failed_sets+' Fandom mapping page'+(data.fandom_failed_sets===1?' needs':'s need')+' review.'; } showCatalogueRebuildStatus(message,data.status==='failed'); return running; }
+function renderCatalogueRebuildStatus(data) {
+  const running=data.status==='running';
+  catalogueRebuildButton.disabled=running;
+  catalogueRebuildButton.textContent=running ? 'Rebuilding catalogue…' : 'Rebuild catalogue from sources';
+  let message=data.message || '';
+  if (data.status==='completed') {
+    const imported=(data.english_prints_imported || 0)+(data.japanese_prints_imported || 0);
+    message+=' '+(imported ? 'Added '+imported+' print record'+(imported===1?'':'s')+'.' : 'No new print records.');
+    if (Number.isInteger(data.searchable_japanese_prints) && Number.isInteger(data.japanese_prints)) {
+      message+=' English-searchable: '+data.searchable_japanese_prints+' of '+data.japanese_prints+' Japanese printings.';
+      if (data.searchable_change > 0) message+=' '+data.searchable_change+' more than before this rebuild.';
+      else if (data.searchable_change < 0) message+=' '+(-data.searchable_change)+' fewer than before this rebuild.';
+    }
+    for (const set of data.new_set_coverage || []) {
+      const serialOnly=set.japanese_prints-set.searchable_japanese_prints;
+      message+=' New set '+set.set_code+': '+set.searchable_japanese_prints+'/'+set.japanese_prints+' English-searchable';
+      if (serialOnly) message+='; '+serialOnly+' searchable by print number only';
+      message+='.';
+    }
+    if (data.english_source_error) message+=' Official English catalogue could not be refreshed: '+data.english_source_error+'.';
+    if (data.fandom_failed_set_codes?.length) message+=' Fandom mappings could not be read for: '+data.fandom_failed_set_codes.join(', ')+'.';
+    else if (data.fandom_failed_sets) message+=' '+data.fandom_failed_sets+' Fandom mapping page'+(data.fandom_failed_sets===1?' needs':'s need')+' review.';
+  }
+  showCatalogueRebuildStatus(message,data.status==='failed');
+  return running;
+}
 async function pollCatalogueRebuild() { try { const running=renderCatalogueRebuildStatus(await readJson(await fetch('/api/catalogue-rebuild'))); if (running) window.setTimeout(pollCatalogueRebuild,2500); } catch (error) { showCatalogueRebuildStatus(error.message,true); catalogueRebuildButton.disabled=false; } }
 async function startCatalogueRebuild() { if (!window.confirm('Rebuild your local catalogue from approved official, Fandom and Yuyu-Tei sources? This can take several minutes and uses your internet, but does not check store prices. Your current catalogue stays usable until the rebuilt copy is ready.')) return; catalogueRebuildButton.disabled=true; showCatalogueRebuildStatus('Starting catalogue rebuild…'); try { const data=await readJson(await fetch('/api/catalogue-rebuild',{method:'POST',headers:{'X-JP-Price-Checker':'1'}})); if (renderCatalogueRebuildStatus(data)) window.setTimeout(pollCatalogueRebuild,2500); } catch (error) { showCatalogueRebuildStatus(error.message,true); catalogueRebuildButton.disabled=false; } }
 catalogueRebuildButton.addEventListener('click',startCatalogueRebuild); pollCatalogueRebuild();

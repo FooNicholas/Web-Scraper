@@ -33,13 +33,13 @@ class FakeJapaneseSource:
         ]
 
 
-def test_full_japanese_import_resumes_by_product_checkpoint(tmp_path: Path) -> None:
+def test_full_japanese_import_rechecks_recent_products_without_double_counting(tmp_path: Path) -> None:
     database = tmp_path / "catalogue.sqlite3"
     source = FakeJapaneseSource()
 
     assert asyncio.run(import_japanese_sets(database, [], all_sets=True, source=source)) == 1  # type: ignore[arg-type]
     assert asyncio.run(import_japanese_sets(database, [], all_sets=True, source=source)) == 0  # type: ignore[arg-type]
-    assert source.calls == [201]
+    assert source.calls == [201, 201]
     with CatalogueRepository(database) as catalogue:
         assert catalogue.japanese_count == 1
 
@@ -51,11 +51,67 @@ def test_current_standard_expansions_excludes_v_era_prs() -> None:
             OfficialExpansion(201, "D-SD01", "D-series"),
             OfficialExpansion(300, "DZ-BT16", "DZ-series"),
             OfficialExpansion(301, "DZ-SS19", "Current DZ Special Series"),
+            OfficialExpansion(1200, "DZ-BT99", "Future Japanese set"),
             OfficialExpansion(2020, None, "2020 PR"),
             OfficialExpansion(2021, None, "2021 PR"),
         ]
     )
-    assert [expansion.id for expansion in selected] == [201, 300, 301, 2021]
+    assert [expansion.id for expansion in selected] == [201, 300, 301, 1200, 2021]
+
+
+def test_full_japanese_import_adds_later_printings_from_the_same_product(tmp_path: Path) -> None:
+    class GrowingSource(FakeJapaneseSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.include_parallel = False
+
+        async def list_expansions(self) -> list[OfficialExpansion]:
+            return [OfficialExpansion(1200, "DZ-BT99", "Future Japanese set")]
+
+        async def cards_for_expansion(self, expansion: OfficialExpansion) -> list[JapaneseCardPrint]:
+            self.calls.append(expansion.id)
+            cards = [JapaneseCardPrint("DZ-BT99", "001", "RRR", "新しいカード", "https://official/new")]
+            if self.include_parallel:
+                cards.append(JapaneseCardPrint("DZ-BT99", "FFR01", "FFR", "新しいカード", "https://official/foil"))
+            return cards
+
+    database = tmp_path / "catalogue.sqlite3"
+    source = GrowingSource()
+    assert asyncio.run(import_japanese_sets(database, [], all_sets=True, source=source)) == 1  # type: ignore[arg-type]
+    source.include_parallel = True
+    assert asyncio.run(import_japanese_sets(database, [], all_sets=True, source=source)) == 1  # type: ignore[arg-type]
+    assert source.calls == [1200, 1200]
+    with CatalogueRepository(database) as catalogue:
+        assert catalogue.japanese_count == 2
+
+
+def test_full_japanese_import_keeps_checkpoints_for_older_products(tmp_path: Path) -> None:
+    class ManyProductsSource:
+        calls: list[int]
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def list_expansions(self) -> list[OfficialExpansion]:
+            return [
+                OfficialExpansion(product_id, f"DZ-BT{product_id}", "Set")
+                for product_id in range(201, 208)
+            ]
+
+        async def cards_for_expansion(self, expansion: OfficialExpansion) -> list[JapaneseCardPrint]:
+            self.calls.append(expansion.id)
+            return [
+                JapaneseCardPrint(
+                    f"DZ-BT{expansion.id}", "001", "RRR", f"Japanese {expansion.id}",
+                    f"https://official/?expansion={expansion.id}",
+                )
+            ]
+
+    source = ManyProductsSource()
+    database = tmp_path / "catalogue.sqlite3"
+    assert asyncio.run(import_japanese_sets(database, [], all_sets=True, source=source)) == 7  # type: ignore[arg-type]
+    assert asyncio.run(import_japanese_sets(database, [], all_sets=True, source=source)) == 0  # type: ignore[arg-type]
+    assert source.calls == [*range(201, 208), *range(202, 208)]
 
 
 def test_current_standard_prints_exclude_legacy_promo_codes() -> None:

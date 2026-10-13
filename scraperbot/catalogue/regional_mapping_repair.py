@@ -107,8 +107,17 @@ async def repair_region_specific_mappings(
     # duplicate already retained evidence; apply each reference only once.
     mappings_by_reference = {
         (mapping.set_code, mapping.collector_number): mapping
-        for mapping in [*retained_mappings, *fetched_mappings]
+        for mapping in fetched_mappings
     }
+    for mapping in retained_mappings:
+        key = (mapping.set_code, mapping.collector_number)
+        # A reviewed card-page or Japanese-promo link outranks a later
+        # provisional set-list row for the same physical printing.
+        if key not in mappings_by_reference or (
+            mapping.source in {"fandom-cross-print", "fandom-japanese-promo", "promo-review"}
+            and mapping.status in {"verified", "reviewed"}
+        ):
+            mappings_by_reference[key] = mapping
     with CatalogueRepository(database) as catalogue:
         archived, removed = catalogue.clear_region_specific_mappings_for_rebuild(wanted)
         restored = catalogue.apply_name_mappings(mappings_by_reference.values()).mapped

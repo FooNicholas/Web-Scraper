@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from scraperbot.catalogue.repository import CatalogueRepository
 from scraperbot.connectors.base import StoreConnector
-from scraperbot.models import Availability, CardPrint, Finish, MatchConfidence, StoreOffer
+from scraperbot.models import Availability, CardPrint, EnglishNameMapping, Finish, JapaneseCardPrint, MatchConfidence, StoreOffer
 from scraperbot.services.comparison import ComparisonService
 from scraperbot.web import INDEX_HTML, LocalPriceCheckWeb
 
@@ -190,6 +190,8 @@ def test_catalogue_rebuild_keeps_the_old_catalogue_live_until_a_staged_refresh_c
     database = tmp_path / "catalogue.sqlite3"
     catalogue = CatalogueRepository(database)
     catalogue.upsert(CardPrint("DZ-BT16", "001", "RRR", "Old Card", japanese_name="古いカード", source="test"))
+    catalogue.import_japanese_many([JapaneseCardPrint("DZ-BT16", "001", "RRR", "古いカード", "https://jp/old")])
+    catalogue.apply_name_mappings([EnglishNameMapping("DZ-BT16", "001", "RRR", "Old Card", "fandom", "https://wiki/old")])
     entered_refresh = Event()
     allow_refresh_to_finish = Event()
 
@@ -202,7 +204,10 @@ def test_catalogue_rebuild_keeps_the_old_catalogue_live_until_a_staged_refresh_c
             staged.upsert(
                 CardPrint("DZ-BT17", "001", "RRR", "New Card", japanese_name="新しいカード", source="test")
             )
-        return SimpleNamespace(english_prints_imported=1, japanese_prints_imported=1, fandom_failed_sets=())
+            staged.import_japanese_many([JapaneseCardPrint("DZ-BT17", "001", "RRR", "新しいカード", "https://jp/new")])
+            staged.apply_name_mappings([EnglishNameMapping("DZ-BT17", "001", "RRR", "New Card", "fandom", "https://wiki/new")])
+        return SimpleNamespace(english_prints_imported=1, english_source_error="English site timed out",
+                               japanese_prints_imported=1, fandom_failed_sets=())
 
     app = LocalPriceCheckWeb(catalogue, ComparisonService([]), catalogue_refresher=refresh_copy)
     try:
@@ -219,11 +224,27 @@ def test_catalogue_rebuild_keeps_the_old_catalogue_live_until_a_staged_refresh_c
         status = app.catalogue_rebuild_status()
         assert status["status"] == "completed"
         assert status["english_prints_imported"] == 1
+        assert status["english_source_error"] == "English site timed out"
+        assert status["searchable_japanese_prints"] == 2
+        assert status["japanese_prints"] == 2
+        assert status["searchable_change"] == 1
+        assert status["new_set_coverage"] == (
+            {"set_code": "DZBT17", "japanese_prints": 1, "searchable_japanese_prints": 1},
+        )
+        assert status["fandom_failed_set_codes"] == ()
         assert app.search("new")["cards"]
         assert app.search("old")["cards"]
     finally:
         allow_refresh_to_finish.set()
         app.catalogue.close()
+
+
+def test_browser_rebuild_result_reports_english_search_coverage() -> None:
+    assert "English-searchable:" in INDEX_HTML
+    assert "New set " in INDEX_HTML
+    assert "Fandom mappings could not be read for:" in INDEX_HTML
+    assert "No new print records." in INDEX_HTML
+    assert "No newly published prints were found." not in INDEX_HTML
 
 
 def test_browser_ui_separates_print_aggregation_from_selected_print_sorting() -> None:

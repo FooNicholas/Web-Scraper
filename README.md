@@ -89,11 +89,19 @@ mappings, and the Yuyu-Tei promo directory. It can take several minutes; it
 does not check price stores, and the current catalogue remains usable until the
 new copy has been checked and installed.
 
+Rebuilding also revisits recent Japanese sets in case more printings were added
+after their first import. The result shows English-search coverage for each new
+set and names any mapping source that could not be read.
+
 This is optional. **Check catalogue update** is faster and uses the reviewed
 release snapshot. A newly published Japanese-only print is searchable by its
 Japanese serial as soon as the official catalogue has it. English-name search
 becomes available once there is direct mapping evidence; the app does not guess
 translations or equate English and Japanese serial numbers.
+
+If the official English catalogue is temporarily unavailable, the rebuild can
+still import Japanese prints and verified Fandom mappings; it reports that the
+English reference catalogue was not refreshed.
 
 ## Stores and limitations
 

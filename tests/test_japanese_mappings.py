@@ -174,6 +174,54 @@ def test_repository_lists_only_japanese_sets_with_missing_name_mappings(tmp_path
         assert catalogue.unmapped_japanese_set_codes() == ["DBT02"]
 
 
+def test_reviewed_card_page_name_survives_a_weaker_set_list_conflict(tmp_path: Path) -> None:
+    with CatalogueRepository(tmp_path / "catalogue.sqlite3") as catalogue:
+        catalogue.import_japanese_many(
+            [JapaneseCardPrint("DZ-BT17", "001", "RRR", "同じ日本語名", "https://jp/001")]
+        )
+        catalogue.apply_name_mappings(
+            [EnglishNameMapping("DZ-BT17", "001", "RRR", "Verified Name",
+                                "fandom-cross-print", "https://wiki/card", status="verified")]
+        )
+        result = catalogue.apply_name_mappings(
+            [EnglishNameMapping("DZ-BT17", "001", "RRR", "Conflicting Name",
+                                "fandom", "https://wiki/set")]
+        )
+
+        assert result.mapped == 0
+        assert [card.collector_number for card in catalogue.search("verified name", japanese_only=True)] == ["001"]
+        assert not catalogue.search("conflicting name", japanese_only=True)
+        row = catalogue.connection.execute(
+            "SELECT english_name FROM english_name_mappings"
+        ).fetchone()
+        assert row["english_name"] == "Verified Name"
+
+
+def test_identity_rebuild_keeps_a_linked_review_when_old_print_claims_disagree(tmp_path: Path) -> None:
+    with CatalogueRepository(tmp_path / "catalogue.sqlite3") as catalogue:
+        catalogue.import_japanese_many(
+            [
+                JapaneseCardPrint("DZ-BT17", "001", "RRR", "同じ日本語名", "https://jp/001"),
+                JapaneseCardPrint("DZ-BT17", "FFR01", "FFR", "同じ日本語名", "https://jp/ffr01"),
+            ]
+        )
+        catalogue.apply_name_mappings(
+            [EnglishNameMapping("DZ-BT17", "001", "RRR", "Accepted Name",
+                                "fandom-cross-print", "https://wiki/card", status="verified")]
+        )
+        catalogue.connection.execute(
+            "UPDATE english_name_mappings SET english_name='Older Translation' "
+            "WHERE japanese_print_id=(SELECT id FROM japanese_prints WHERE collector_number='FFR01')"
+        )
+        catalogue.connection.commit()
+
+        _, links = catalogue.rebuild_card_identities()
+
+        assert links == 2
+        assert {card.collector_number for card in catalogue.search("accepted name", japanese_only=True)} == {"001", "FFR01"}
+        assert not catalogue.search("older translation", japanese_only=True)
+
+
 def test_shared_identity_includes_region_specific_promo_without_serial_equality(tmp_path: Path) -> None:
     with CatalogueRepository(tmp_path / "catalogue.sqlite3") as catalogue:
         catalogue.import_japanese_many(

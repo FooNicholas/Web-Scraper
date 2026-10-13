@@ -26,6 +26,7 @@ class OfficialPromo:
 
 class OfficialPromoSource:
     url = "https://cf-vanguard.com/cardlist/card_pr"
+    api_url = "https://cf-vanguard.com/manage/card-pr-user/list"
 
     def __init__(self, client=None, *, page_delay=1.0):
         self.client = client
@@ -74,18 +75,39 @@ class OfficialPromoSource:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 return await OfficialPromoSource(client, page_delay=self.page_delay).fetch(progress)
         pending, visited, entries = {1}, set(), {}
+        api_mode = False
         while pending:
             page = min(pending)
             pending.remove(page)
             if visited:
                 await asyncio.sleep(self.page_delay)
-            url = self.url if page == 1 else f"https://cf-vanguard.com/cardlist/card-pr?page={page}"
+            url = self.api_url if api_mode else (
+                self.url if page == 1 else f"{self.url}/?page={page}"
+            )
             try:
-                response = await self.client.get(url, headers={"User-Agent": "JP-Price-Checker/0.1 (local catalogue import)"})
+                response = await self.client.get(
+                    url,
+                    params={"page": page} if api_mode else None,
+                    headers={"User-Agent": "JP-Price-Checker/0.1 (local catalogue import)"},
+                )
                 response.raise_for_status()
             except httpx.HTTPError as error:
                 raise OfficialSourceError(f"Official PR page {page} failed; catalogue left unchanged.") from error
-            batch, links = self.parse_page(response.text)
+            if api_mode:
+                try:
+                    payload = response.json()
+                except ValueError as error:
+                    raise OfficialSourceError("Official PR API did not return JSON.") from error
+                batch, links = self.parse_api_page(payload)
+            else:
+                try:
+                    batch, links = self.parse_page(response.text)
+                except OfficialSourceError:
+                    if page != 1:
+                        raise
+                    api_mode = True
+                    pending.add(1)
+                    continue
             for entry in batch:
                 key = entry.card.collector_number
                 previous = entries.get(key)
@@ -101,6 +123,38 @@ class OfficialPromoSource:
         if not entries:
             raise OfficialSourceError("No Japanese D-PR records found; catalogue left unchanged.")
         return list(entries.values())
+
+    @classmethod
+    def parse_api_page(cls, payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise OfficialSourceError("Official PR API returned an unrecognised card list.")
+        pages = payload.get("pages")
+        if not isinstance(pages, int) or not 1 <= pages <= 200:
+            raise OfficialSourceError("Official PR API returned invalid pagination.")
+        entries = []
+        for rows, scheduled in ((payload["items"], False), (payload.get("scheduled", []), True)):
+            if not isinstance(rows, list):
+                raise OfficialSourceError("Official PR API returned invalid card rows.")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise OfficialSourceError("Official PR API returned an invalid card row.")
+                number = re.fullmatch(r"D-PR/(\d+)", str(row.get("card_number") or "").strip())
+                if not number:
+                    continue
+                name = str(row.get("card_name") or "").strip()
+                if not name:
+                    raise OfficialSourceError("Official PR API card has no Japanese name.")
+                serial = number.group(1)
+                entries.append(OfficialPromo(
+                    JapaneseCardPrint("DPR", serial, "", name,
+                                      f"https://cf-vanguard.com/cardlist/?cardno=D-PR/{serial}"),
+                    distribution=str(row.get("dist_way") or "").strip(),
+                    available_from=str(row.get("card_use") or "").strip() or None if scheduled else None,
+                ))
+        page = payload.get("page")
+        if not isinstance(page, int) or not 1 <= page <= pages:
+            raise OfficialSourceError("Official PR API returned an invalid page number.")
+        return entries, ({page + 1} if page < pages else set())
 
 
 async def import_official_promos(database: Path, *, source=None, progress=None) -> int:

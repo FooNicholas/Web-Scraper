@@ -276,7 +276,9 @@ class CatalogueRepository:
         )
         self._migrate_card_identities()
 
-    def _migrate_card_identities(self) -> None:
+    def _migrate_card_identities(
+        self, preferred: dict[str, sqlite3.Row] | None = None
+    ) -> None:
         """Build shared identities from previously accepted one-print mappings.
 
         This is a one-way compatibility migration: legacy per-print mappings
@@ -304,9 +306,16 @@ class CatalogueRepository:
                 continue
             candidates.setdefault(str(row['japanese_name']), {}).setdefault(str(row['english_name']), row)
         for japanese_name, names in candidates.items():
-            if len(names) != 1:
-                continue
-            row = next(iter(names.values()))
+            if len(names) == 1:
+                row = next(iter(names.values()))
+            else:
+                # A rebuild can encounter older per-print translations that
+                # disagree with an identity already accepted for search. Keep
+                # that linked identity; a fresh ambiguous name still needs
+                # review before it becomes searchable.
+                row = (preferred or {}).get(japanese_name)
+                if row is None or row["english_name"] not in names:
+                    continue
             identity_id = self._upsert_card_identity(
                 japanese_name,
                 str(row['english_name']),
@@ -319,10 +328,23 @@ class CatalogueRepository:
 
     def rebuild_card_identities(self) -> tuple[int, int]:
         """Recreate shared search identities from current safe mapping evidence."""
+        preferred = {
+            str(row["japanese_name"]): row
+            for row in self.connection.execute(
+                """
+                SELECT i.* FROM card_identities AS i
+                WHERE i.status != 'conflicted'
+                  AND EXISTS (
+                    SELECT 1 FROM japanese_print_identity_links AS l
+                    WHERE l.card_identity_id = i.id
+                  )
+                """
+            )
+        }
         self.connection.execute("DELETE FROM card_identity_search")
         self.connection.execute("DELETE FROM japanese_print_identity_links")
         self.connection.execute("DELETE FROM card_identities")
-        self._migrate_card_identities()
+        self._migrate_card_identities(preferred)
         identities = int(self.connection.execute("SELECT COUNT(*) FROM card_identities").fetchone()[0])
         links = int(self.connection.execute("SELECT COUNT(*) FROM japanese_print_identity_links").fetchone()[0])
         return identities, links
@@ -399,6 +421,8 @@ class CatalogueRepository:
             current_rank = self._identity_source_rank(existing['mapping_source'], existing['status'])
             incoming_rank = self._identity_source_rank(source, status)
             if existing['english_name'] != english_name:
+                if current_rank > incoming_rank:
+                    return int(existing['id'])
                 # Different English names for one canonical Japanese name are
                 # evidence of an unresolved mapping conflict.  Do not let
                 # arrival order decide which name users can search. A direct
@@ -558,6 +582,29 @@ class CatalogueRepository:
                     and japanese["japanese_name"] in HELD_UTILITY_PROMO_NAMES
                 ):
                     continue
+                incoming_rank = self._identity_source_rank(mapping.source, mapping.status)
+                if incoming_rank < 3:
+                    prior = self.connection.execute(
+                        """
+                        SELECT english_name, mapping_source, status
+                        FROM english_name_mappings WHERE japanese_print_id = ?
+                        """,
+                        (japanese["id"],),
+                    ).fetchone()
+                    identity = self.connection.execute(
+                        """
+                        SELECT english_name, mapping_source, status
+                        FROM card_identities WHERE japanese_name = ?
+                        """,
+                        (japanese["japanese_name"],),
+                    ).fetchone()
+                    if any(
+                        row is not None
+                        and row["english_name"] != mapping.english_name
+                        and self._identity_source_rank(row["mapping_source"], row["status"]) > incoming_rank
+                        for row in (prior, identity)
+                    ):
+                        continue
                 # Archive any legacy equal-reference claim before the trusted
                 # Japanese-name mapping is written. This is preservation, not
                 # a match: no English serial is read to determine equality.

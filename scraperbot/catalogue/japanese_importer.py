@@ -10,23 +10,45 @@ from pathlib import Path
 from scraperbot.catalogue.japanese_source import OfficialJapaneseCardSource
 from scraperbot.catalogue.official_source import OfficialExpansion, OfficialSourceError
 from scraperbot.catalogue.repository import CatalogueRepository
-from scraperbot.models import JapaneseCardPrint
+from scraperbot.models import JapaneseCardPrint, normalise_set_code
+
+
+# A new product page may publish more printings after its first import. Revisit
+# recent D/DZ products on each explicit rebuild while older products retain
+# their resume checkpoints.
+RECENT_PRODUCT_RECHECK_COUNT = 6
 
 
 def current_standard_expansions(expansions: list[OfficialExpansion]) -> list[OfficialExpansion]:
     """Keep D/DZ-era product pages, excluding V-series and older formats.
 
-    Bushiroad's public catalogue gives D-SD01 the product id 201 and current
-    D/DZ product IDs occupy the three-digit range starting at 201 and continue
-    to grow as new products are published. Annual PR pages use a four-digit
-    year, so 2021 onward remains part of the current Standard-format catalogue
-    while the 2020 V-era PR page stays excluded.
+    Recognised D/DZ set codes remain eligible even after product IDs pass the
+    three-digit range. Older entries without a parsed code retain the known
+    201–999 range; annual PR pages start with 2021, after the V-era PR page.
     """
     return [
         expansion
         for expansion in expansions
-        if 201 <= expansion.id < 1000 or expansion.id >= 2021
+        if (
+            expansion.set_code is not None
+            and normalise_set_code(expansion.set_code).startswith("D")
+            and expansion.id >= 201
+        )
+        or (expansion.set_code is None and (201 <= expansion.id < 1000 or expansion.id >= 2021))
     ]
+
+
+def recent_product_expansion_ids(expansions: list[OfficialExpansion]) -> set[int]:
+    """Choose current D/DZ products whose official rows may still grow."""
+    product_ids = sorted(
+        (
+            expansion.id
+            for expansion in expansions
+            if expansion.set_code and normalise_set_code(expansion.set_code).startswith("D")
+        ),
+        reverse=True,
+    )
+    return set(product_ids[:RECENT_PRODUCT_RECHECK_COUNT])
 
 
 def current_standard_prints(cards: list[JapaneseCardPrint]) -> list[JapaneseCardPrint]:
@@ -48,18 +70,21 @@ async def import_japanese_sets(
         if all_sets
         else await source.expansions_for_sets(set_codes)
     )
+    recheck_ids = recent_product_expansion_ids(expansions) if all_sets else set()
     with CatalogueRepository(database) as catalogue:
         imported = 0
         for index, expansion in enumerate(expansions, start=1):
             label = expansion.set_code or expansion.title
-            if all_sets and catalogue.has_japanese_expansion(expansion.id):
+            if all_sets and expansion.id not in recheck_ids and catalogue.has_japanese_expansion(expansion.id):
                 if progress:
                     progress(index, len(expansions), label, None)
                 continue
             cards = await source.cards_for_expansion(expansion)
             if all_sets:
                 cards = current_standard_prints(cards)
-            imported += catalogue.import_japanese_many(cards)
+            before = catalogue.japanese_count
+            catalogue.import_japanese_many(cards)
+            imported += catalogue.japanese_count - before
             catalogue.mark_japanese_expansion_imported(expansion.id)
             if progress:
                 progress(index, len(expansions), label, len(cards))
