@@ -58,6 +58,8 @@ def main() -> None:
         str(build_root.resolve()),
         "--paths",
         str(ROOT),
+        "--collect-all",
+        "selenium",
         "--add-data",
         f"{snapshot_directory.resolve()}{separator}catalogue",
         str(ROOT / "scraperbot" / "desktop.py"),

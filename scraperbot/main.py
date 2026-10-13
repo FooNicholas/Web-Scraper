@@ -13,6 +13,7 @@ from scraperbot.connectors.advantage import AdvantageConnector
 from scraperbot.connectors.bigweb import BigWebConnector
 from scraperbot.connectors.cardmax import CardMaxConnector
 from scraperbot.connectors.cardrush import CardRushConnector
+from scraperbot.connectors.hobbystation import HobbyStationConnector
 from scraperbot.connectors.clabo import CLaboConnector
 from scraperbot.connectors.avalon import AvalonConnector
 from scraperbot.connectors.amenitydream import AmenityDreamConnector
@@ -78,6 +79,7 @@ def build_application(settings: Settings | None = None) -> Application:
                 SquareBushiroadConnector(),
                 MastersGuildConnector(),
                 GProjectConnector(),
+                HobbyStationConnector(),
             )
         ),
     )

@@ -36,6 +36,7 @@ from scraperbot.connectors.advantage import AdvantageConnector
 from scraperbot.connectors.bigweb import BigWebConnector
 from scraperbot.connectors.cardmax import CardMaxConnector
 from scraperbot.connectors.cardrush import CardRushConnector
+from scraperbot.connectors.hobbystation import HobbyStationConnector
 from scraperbot.connectors.clabo import CLaboConnector
 from scraperbot.connectors.avalon import AvalonConnector
 from scraperbot.connectors.amenitydream import AmenityDreamConnector
@@ -675,6 +676,7 @@ def build_web_application(settings: Settings | None = None) -> LocalPriceCheckWe
             SquareBushiroadConnector(),
             MastersGuildConnector(),
             GProjectConnector(),
+            HobbyStationConnector(),
         )
     )
     return application
