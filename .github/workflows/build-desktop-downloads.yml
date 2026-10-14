@@ -78,13 +78,57 @@ jobs:
       - name: Archive native app
         shell: python
         run: |
+          import subprocess
+          import sys
           from pathlib import Path
           from shutil import make_archive
 
           app = Path("${{ matrix.artifact_path }}")
           release = Path("release")
           release.mkdir(exist_ok=True)
-          make_archive(str(release / "jp-price-checker-${{ matrix.name }}-${{ inputs.catalogue_version }}"), "zip", app.parent, app.name)
+          archive = release / "jp-price-checker-${{ matrix.name }}-${{ inputs.catalogue_version }}.zip"
+          if sys.platform == "darwin":
+              # Python's ZIP writer dereferences framework symlinks, leaving
+              # the extracted macOS app unable to load Python extensions.
+              subprocess.run(["ditto", "-c", "-k", "--keepParent", str(app), str(archive)], check=True)
+          else:
+              make_archive(str(archive.with_suffix("")), "zip", app.parent, app.name)
+
+      - name: Smoke-test archived app
+        shell: python
+        run: |
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          archive = Path("release/jp-price-checker-${{ matrix.name }}-${{ inputs.catalogue_version }}.zip")
+          with tempfile.TemporaryDirectory() as directory:
+              if sys.platform == "darwin":
+                  subprocess.run(["ditto", "-x", "-k", str(archive), directory], check=True)
+                  executable = Path(directory) / "JP Price Checker.app/Contents/MacOS/JP Price Checker"
+              else:
+                  with ZipFile(archive) as zipped:
+                      zipped.extractall(directory)
+                  executable = Path(directory) / "JP Price Checker/JP Price Checker.exe"
+              environment = os.environ | {"SCRAPERBOT_DATA_DIR": str(Path(directory) / "user-data")}
+              if sys.platform == "darwin":
+                  environment["BROWSER"] = "/usr/bin/true"
+              process = subprocess.Popen([str(executable)], env=environment)
+              try:
+                  time.sleep(6)
+                  if process.poll() is not None:
+                      raise RuntimeError(f"Archived app exited during startup: {process.returncode}")
+              finally:
+                  process.terminate()
+                  try:
+                      process.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      process.kill()
+                      process.wait()
 
       - name: Upload native app artifact
         uses: actions/upload-artifact@v4
